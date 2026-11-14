@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lectern Reader</title>
+<meta name="description" content="Listen to your books with natural Google voices and follow along word by word.">
+<meta name="theme-color" content="#0C6B62">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Instrument+Sans:wght@400;500;600&family=Lexend:wght@400;600&family=Literata:opsz,wght@7..72,400;7..72,600&display=swap">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="top gutter">
+    <span class="brand">Lectern</span>
+    <span class="title" id="bookTitle"></span>
+    <select id="chapterSel" aria-label="Chapter"></select>
+    <button class="btn" id="displayBtn" type="button">Settings</button>
+    <button class="btn primary" id="libraryBtn" type="button">Library</button>
+  </header>
+
+  <main class="stage gutter" id="stage">
+    <article class="reader" id="reader" aria-live="off"></article>
+    <div class="endnav">
+      <button class="btn" id="prevCh" type="button">← Previous chapter</button>
+      <button class="btn" id="nextCh" type="button">Next chapter →</button>
+    </div>
+  </main>
+
+  <footer class="deck gutter">
+    <div class="prog">
+      <span id="posLabel">–</span>
+      <input type="range" id="seek" min="0" max="0" value="0" step="1" aria-label="Position in chapter">
+      <span id="leftLabel">–</span>
+    </div>
+    <div class="ctl">
+      <div class="transport">
+        <button class="icon" id="prevBtn" type="button" aria-label="Previous sentence" title="Previous sentence (←)"><svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg></button>
+        <button class="icon play" id="playBtn" type="button" aria-label="Play" title="Play or pause (Space)"><svg viewBox="0 0 24 24" id="playIcon"><path d="M7 4v16l14-8z"/></svg></button>
+        <button class="icon" id="nextBtn" type="button" aria-label="Next sentence" title="Next sentence (→)"><svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg></button>
+      </div>
+      <label>Speed
+        <select id="rateSel">
+          <option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1">1×</option>
+          <option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option>
+          <option value="2">2×</option><option value="2.5">2.5×</option><option value="3">3×</option>
+        </select>
+      </label>
+      <label class="voice">Voice
+        <select id="voiceSel"><option value="">Default voice</option></select>
+      </label>
+    </div>
+    <div class="note" id="voiceNote" hidden></div>
+  </footer>
+</div>
+
+<dialog class="sheet" id="libraryDlg" aria-labelledby="libH">
+  <div class="sheet-in">
+    <div class="sheet-head"><h3 id="libH">Library</h3><button class="btn" type="button" data-close>Close</button></div>
+    <section>
+      <h4>Add a book</h4>
+      <div class="drop" id="drop">
+        <button class="btn primary" id="pickBtn" type="button">Choose a file</button>
+        <small>EPUB, PDF, Word (.docx), text, Markdown or HTML. Scanned PDFs and photos of pages (JPEG or PNG, several at once) are read by Google once your key is saved. You can also drop files anywhere on the page. Books stay on this device.</small>
+        <input type="file" id="fileIn" multiple accept=".epub,.pdf,.docx,.txt,.md,.markdown,.html,.htm,text/plain,application/pdf,application/epub+zip,image/jpeg,image/png,image/webp" hidden>
+      </div>
+      <p class="status" id="status" role="status"></p>
+      <div class="ocr" id="ocrBox" hidden>
+        <p id="ocrMsg"></p>
+        <div class="row" id="ocrRange">
+          <label for="ocrFrom">Pages</label><input type="number" id="ocrFrom" min="1" value="1">
+          <label for="ocrTo">to</label><input type="number" id="ocrTo" min="1" value="1">
+        </div>
+        <div class="row">
+          <button class="btn primary" id="ocrGo" type="button">Read these pages</button>
+          <button class="btn" id="ocrStop" type="button" hidden>Stop</button>
+        </div>
+      </div>
+    </section>
+    <section class="paste">
+      <h4>Or paste text</h4>
+      <input type="text" id="pasteTitle" placeholder="Title (optional)" aria-label="Title for pasted text">
+      <textarea id="pasteText" placeholder="Paste an article, a chapter, anything…" aria-label="Text to read"></textarea>
+      <div><button class="btn" id="pasteBtn" type="button">Add to library</button></div>
+    </section>
+    <section>
+      <h4>Your books</h4>
+      <div class="row2">
+        <button class="btn" id="exportBtn" type="button">Save a backup file</button>
+        <button class="btn" id="importBtn" type="button">Restore from backup</button>
+        <input type="file" id="backupIn" accept=".json,application/json" hidden>
+      </div>
+      <p class="status">Books live in this browser. A backup file moves your library and reading positions to another device.</p>
+      <ul class="books" id="books"></ul>
+    </section>
+  </div>
+</dialog>
+
+<dialog class="sheet" id="displayDlg" aria-labelledby="dispH">
+  <div class="sheet-in">
+    <div class="sheet-head"><h3 id="dispH">Settings</h3><button class="btn" type="button" data-close>Close</button></div>
+    <div class="field">
+      <h4>Natural voices · Google</h4>
+      <div class="row"><input type="password" id="gKey" placeholder="Google API key" aria-label="Google API key" autocomplete="off" spellcheck="false"><button class="btn primary" id="gSave" type="button">Save</button></div>
+      <p class="status" id="gStatus" role="status"></p>
+      <label class="stack" for="gEngine">Voice engine<select id="gEngine"></select></label>
+      <label class="stack" id="gStyleWrap" for="gStyle">Narration style (Gemini voices)<input type="text" id="gStyle" maxlength="200"></label>
+      <label class="stack" id="gLangWrap" for="gLang" hidden>Voice language<select id="gLang"></select></label>
+      <div class="row2">
+        <button class="btn" id="gOffline" type="button">Save this chapter for offline</button>
+        <button class="btn quiet" id="gClear" type="button">Clear saved audio</button>
+      </div>
+      <p class="status" id="gUsage"></p>
+      <details>
+        <summary>How to get a key</summary>
+        <ol>
+          <li>Open <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>, sign in and create an API key. That key works with the Gemini speech models, including Flash-Lite, and reads scanned pages.</li>
+          <li>Paste the key above and press Save. The app lists the speech models your key offers and picks the cheapest.</li>
+          <li>Optional: for Chirp 3 HD as well, enable the <b>Cloud Text-to-Speech API</b> in the same Google Cloud project.</li>
+        </ol>
+        <p>The key is kept only in this browser and is sent only to Google. Usage beyond Google’s free allowance is billed to the key’s project; see <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener">Google’s pricing</a>.</p>
+      </details>
+    </div>
+    <div class="field">
+      <h4>Appearance</h4>
+      <select id="themeSel" aria-label="Colour theme"><option value="auto">Match this device</option><option value="light">Light</option><option value="dark">Dark</option></select>
+    </div>
+    <div class="field">
+      <h4>Typeface</h4>
+      <select id="fontSel">
+        <option value="book">Literata (book serif)</option>
+        <option value="atkinson">Atkinson Hyperlegible (high legibility)</option>
+        <option value="lexend">Lexend (wide, easy tracking)</option>
+        <option value="system">System sans-serif</option>
+      </select>
+    </div>
+    <div class="field"><h4>Text size</h4><div class="row"><input type="range" id="sizeR" min="15" max="34" step="1"><output id="sizeO"></output></div></div>
+    <div class="field"><h4>Line spacing</h4><div class="row"><input type="range" id="lhR" min="1.3" max="2.4" step="0.05"><output id="lhO"></output></div></div>
+    <div class="field"><h4>Column width</h4><div class="row"><input type="range" id="widthR" min="38" max="90" step="2"><output id="widthO"></output></div></div>
+    <div class="field">
+      <h4>Reading aids</h4>
+      <label class="check"><input type="checkbox" id="wordC"><span>Highlight each word<small>Follows the voice word by word inside the highlighted sentence.</small></span></label>
+      <label class="check"><input type="checkbox" id="focusC"><span>Focus mode<small>Dims every paragraph except the one being read.</small></span></label>
+      <label class="check"><input type="checkbox" id="scrollC"><span>Keep my place on screen<small>Scrolls so the current sentence stays in view.</small></span></label>
+      <label class="check"><input type="checkbox" id="voiceC"><span>Read aloud with a voice<small>Turn off to use the moving highlight as a silent pacer at the chosen speed.</small></span></label>
+    </div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="app.js" defer></script>
+</body>
+</html>
