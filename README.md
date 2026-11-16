@@ -57,7 +57,15 @@ How sync decides: a book added on one device is uploaded and appears on the othe
 scanned pages read) replaces the older copy; a book removed on one device is removed everywhere (kept for 180
 days as a deletion record); for each book the most recent reading position wins.
 
-Tests for the merge rules: `node --test tests/sync.test.js`
+## Word highlight
+
+Google's voices send audio only, with no word positions, so the word highlight is timed from the audio itself
+(`align.js`): it finds where speech starts and ends and where the voice pauses, matches those pauses to the
+passage's punctuation and paragraph breaks, and spreads the words between pauses by an estimate of how long each
+takes to say. It follows the audio's own clock, so pausing and speed changes stay in step. It is still an estimate
+within each stretch between pauses, usually within a word of the voice.
+
+Tests: `node --test tests/sync.test.js tests/align.test.js`
 
 ## How it works
 

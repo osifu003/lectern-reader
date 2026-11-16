@@ -789,7 +789,7 @@
   }
   const audioEl = new Audio(); audioEl.preload = 'auto';
   const gtts = (() => { // a small player: a queue of passages, fetched ahead and played back to back on one audio element
-    const H = { line: [], pos: [], state: [] };
+    const H = { line: [], pos: [], state: [], audio: [] };
     let q = [], cur = null, run = 0, rate = 1, voice = '', paused = false, busy = false;
     const emit = (k, e) => H[k].forEach(f => { try { f(e); } catch (err) { console.error(err); } });
     const drop = why => { for (const it of q) it.rej(why); if (cur) cur.rej(why); q = []; cur = null; };
@@ -798,7 +798,7 @@
       if (opts && opts.rate) rate = opts.rate;
       return Promise.all(lines.map(l => new Promise((res, rej) => {
         const it = { id: l.id, res, rej, blob: synthLine(l.text, voice) };
-        it.blob.catch(() => {});
+        it.blob.then(blob => emit('audio', { id: l.id, blob }), () => {}); // lets the word timing be worked out before the passage plays
         q.push(it);
       })));
     }
@@ -823,7 +823,7 @@
           const tick = () => {
             if (my !== run || cur !== it || audioEl.ended || audioEl.error) return done();
             emit('pos', { ms: audioEl.currentTime * 1000, dur: (isFinite(audioEl.duration) ? audioEl.duration : 0) * 1000, id: it.id });
-            setTimeout(tick, 50);
+            setTimeout(tick, 30);
           };
           tick();
         });
@@ -841,7 +841,7 @@
       unlock() { if (!busy) { audioEl.src = SILENCE; audioEl.play().catch(() => {}); } },
       setRate(r) { rate = r; audioEl.playbackRate = r; },
       active: () => busy, isPaused: () => busy && paused,
-      onLine: f => H.line.push(f), onPosition: f => H.pos.push(f), onState: f => H.state.push(f)
+      onLine: f => H.line.push(f), onPosition: f => H.pos.push(f), onState: f => H.state.push(f), onAudio: f => H.audio.push(f)
     };
   })();
   const GEM_VOICES = [['Sulafat', 'warm'], ['Achird', 'friendly'], ['Vindemiatrix', 'gentle'], ['Achernar', 'soft'], ['Algieba', 'smooth'], ['Despina', 'smooth'], ['Charon', 'informative'], ['Rasalgethi', 'informative'],
@@ -1035,10 +1035,41 @@
   function lineMarks(line) {
     const m = model(line.c); line.marks = []; let acc = 0;
     for (let i = line.from; i <= line.to; i++) {
-      const re = /\S+/g; let x, k = 0;
-      while ((x = re.exec(m[i].text))) { line.marks.push({ s: i, k: k++, at: acc }); acc += wUnit(x[0]); }
+      const ws = m[i].text.match(/\S+/g) || [], para = i === line.to || m[i + 1].p !== m[i].p;
+      ws.forEach((t, k) => {
+        const brk = window.LecternAlign ? LecternAlign.breakAfter(t, k === ws.length - 1, para && k === ws.length - 1) : 0;
+        line.marks.push({ s: i, k, at: acc, t, brk });
+        acc += wUnit(t);
+      });
     }
     line.total = acc;
+  }
+  /* Word timing from the audio itself: Google sends no word positions, so the pauses in each passage are found and
+     matched to its punctuation, and the words between pauses are spread by how long each takes to say (align.js). */
+  const timesCache = new Map();
+  async function audioSamples(blob) {
+    const buf = await (blob.arrayBuffer ? blob.arrayBuffer() : new Response(blob).arrayBuffer());
+    const wav = LecternAlign.pcmFromWav(buf); // Gemini's audio: read the samples directly, no decoder needed
+    if (wav) return wav;
+    const C = window.OfflineAudioContext || window.webkitOfflineAudioContext; // Chirp's MP3
+    if (!C) return null;
+    const ctx = new C(1, 1, 44100);
+    const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(buf, res, rej); if (p && p.then) p.then(res, rej); });
+    return { samples: ab.getChannelData(0), rate: ab.sampleRate };
+  }
+  function timeLine(line, blob) {
+    if (!window.LecternAlign || line.times !== undefined) return;
+    if (!line.marks) lineMarks(line);
+    const key = settings.voiceURI + '|' + settings.gengine + '|' + settings.gstyle + '|' + line.text;
+    if (timesCache.has(key)) { line.times = timesCache.get(key); return; }
+    line.times = null; // working on it; the estimate is used until it is ready
+    audioSamples(blob).then(a => {
+      const t = a && LecternAlign.timeWords(a.samples, a.rate, line.marks);
+      if (!t || t.length !== line.marks.length) return;
+      line.times = t;
+      timesCache.set(key, t);
+      if (timesCache.size > 60) timesCache.delete(timesCache.keys().next().value);
+    }).catch(err => console.warn('Word timing unavailable for a passage; using the estimate.', err));
   }
   function calibrate() { // learn this voice's real pace from the line that just finished
     if (!pline || plastMs < 2500 || !pline.total) return;
@@ -1069,10 +1100,11 @@
     if (Date.now() - pStarted > 700) go(); else later(go, 350);
   }
   function wireTts() {
+    tts.onAudio(({ id, blob }) => { const line = plines.get(id); if (line) timeLine(line, blob); });
     tts.onLine(({ id }) => {
       const line = plines.get(id);
       if (!line || !playing || !String(id).startsWith(pgen + ':')) return;
-      calibrate(); pline = line; plastMs = 0; pmark = 0; lineMarks(line);
+      calibrate(); pline = line; plastMs = 0; pmark = 0; if (!line.marks) lineMarks(line);
       if (line.c !== ci) { ci = line.c; renderChapter(line.from); } else activate(line.from);
       setWord(0);
       const n = nextLine();
@@ -1081,8 +1113,15 @@
     tts.onPosition(({ ms, dur, id }) => {
       if (!pline || id !== pline.id || !playing || pline.c !== ci) return;
       plastMs = ms;
-      const unit = dur ? ms / dur * pline.total : ms / (P_BASE / pRate() * pk), marks = pline.marks;
-      while (pmark + 1 < marks.length && marks[pmark + 1].at <= unit) pmark++;
+      const marks = pline.marks, times = pline.times;
+      if (times) { // timed from the audio: follow the clock both ways
+        const t = ms / 1000 + 0.06; // a hair early, so the highlight lands as the word is heard
+        while (pmark + 1 < marks.length && times[pmark + 1] <= t) pmark++;
+        while (pmark > 0 && times[pmark] > t) pmark--;
+      } else {
+        const unit = dur ? ms / dur * pline.total : ms / (P_BASE / pRate() * pk);
+        while (pmark + 1 < marks.length && marks[pmark + 1].at <= unit) pmark++;
+      }
       const mk = marks[pmark]; if (!mk) return;
       if (mk.s !== si) activate(mk.s);
       setWord(mk.k);
