@@ -22,6 +22,8 @@
     <button class="btn primary" id="libraryBtn" type="button">Library</button>
   </header>
 
+  <div class="syncbar gutter" id="syncBar" hidden><span>Sync with your other devices is paused.</span><button class="btn" id="syncBarBtn" type="button">Reconnect</button></div>
+
   <main class="stage gutter" id="stage">
     <article class="reader" id="reader" aria-live="off"></article>
     <div class="endnav">
@@ -64,7 +66,7 @@
       <h4>Add a book</h4>
       <div class="drop" id="drop">
         <button class="btn primary" id="pickBtn" type="button">Choose a file</button>
-        <small>EPUB, PDF, Word (.docx), text, Markdown or HTML. Scanned PDFs and photos of pages (JPEG or PNG, several at once) are read by Google once your key is saved. You can also drop files anywhere on the page. Books stay on this device.</small>
+        <small>EPUB, PDF, Word (.docx), text, Markdown or HTML. Scanned PDFs and photos of pages (JPEG or PNG, several at once) are read by Google once your key is saved. You can also drop files anywhere on the page. Books stay on this device unless you turn on sync in Settings.</small>
         <input type="file" id="fileIn" multiple accept=".epub,.pdf,.docx,.txt,.md,.markdown,.html,.htm,text/plain,application/pdf,application/epub+zip,image/jpeg,image/png,image/webp" hidden>
       </div>
       <p class="status" id="status" role="status"></p>
@@ -93,7 +95,8 @@
         <button class="btn" id="importBtn" type="button">Restore from backup</button>
         <input type="file" id="backupIn" accept=".json,application/json" hidden>
       </div>
-      <p class="status">Books live in this browser. A backup file moves your library and reading positions to another device.</p>
+      <div class="libsync" id="libSync" hidden><span id="libSyncMsg" role="status"></span><button class="btn" id="libSyncBtn" type="button">Sync now</button></div>
+      <p class="status" id="libNote">Books live in this browser. A backup file moves your library and reading positions to another device.</p>
       <ul class="books" id="books"></ul>
     </section>
   </div>
@@ -124,6 +127,28 @@
         <p>The key is kept only in this browser and is sent only to Google. Usage beyond Google’s free allowance is billed to the key’s project; see <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener">Google’s pricing</a>.</p>
       </details>
     </div>
+    <div class="field" id="syncField">
+      <h4>Sync across devices · Google Drive</h4>
+      <p class="status" id="syncStatus" role="status"></p>
+      <div class="row2">
+        <button class="btn primary" id="syncIn" type="button">Sign in with Google</button>
+        <button class="btn" id="syncNow" type="button" hidden>Sync now</button>
+        <button class="btn quiet" id="syncOut" type="button" hidden>Sign out</button>
+      </div>
+      <details id="syncSetup">
+        <summary>Set up sync (one time)</summary>
+        <p>Sync signs in with a Google client ID that belongs to you, so nobody else's server is involved. Make it once on a computer:</p>
+        <ol>
+          <li>Open <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noopener">console.cloud.google.com</a> and create a project named Lectern.</li>
+          <li>In <b>APIs &amp; Services › Library</b>, find <b>Google Drive API</b> and press Enable.</li>
+          <li>Open <b>Google Auth Platform</b> and press Get started. App name Lectern, your Gmail as support and contact email, Audience <b>External</b>. Under <b>Audience</b>, add your Gmail as a test user.</li>
+          <li>Under <b>Clients</b>, create a client of type <b>Web application</b>. Add <b id="syncOrigin">https://osifu003.github.io</b> under Authorized JavaScript origins and <b id="syncRedirect">https://osifu003.github.io/lectern-reader/</b> under Authorized redirect URIs.</li>
+          <li>Copy the Client ID it shows, paste it here, press Save, then Sign in with Google. Do the same on each device, or have the ID built into the app.</li>
+        </ol>
+        <div class="row"><input type="text" id="syncClient" placeholder="…apps.googleusercontent.com" aria-label="Google client ID" autocomplete="off" spellcheck="false"><button class="btn" id="syncClientSave" type="button">Save</button></div>
+        <p>Books, chapters and reading positions go to a hidden folder in your own Google Drive that only Lectern can open. Saved audio, your API key and display settings stay on each device. Signing in lasts about an hour at a time; after that the app asks you to reconnect, and changes made meanwhile are kept and sent then.</p>
+      </details>
+    </div>
     <div class="field">
       <h4>Appearance</h4>
       <select id="themeSel" aria-label="Colour theme"><option value="auto">Match this device</option><option value="light">Light</option><option value="dark">Dark</option></select>
@@ -151,6 +176,7 @@
 </dialog>
 
 <div class="toast" id="toast" role="status" hidden></div>
+<script src="sync.js" defer></script>
 <script src="app.js" defer></script>
 <div class="drag-veil" id="dragVeil" aria-hidden="true"><div class="drag-veil-in"><strong>Drop to add to your library</strong><small>PDF, EPUB, Word, text or page photos</small></div></div>
 </body>

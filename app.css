@@ -145,3 +145,10 @@ a { color: var(--accent); }
 .drag-veil.on { display: grid; }
 .drag-veil-in { display: grid; gap: 6px; justify-items: center; text-align: center; width: min(520px, 100%); padding: 48px 24px; border: 3px dashed var(--accent); border-radius: 18px; background: var(--page); color: var(--accent); font-size: 1.25rem; }
 .drag-veil-in small { color: var(--muted); font-size: .9rem; }
+
+/* sync */
+.syncbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-block: 6px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--accent) 10%, var(--page)); font-size: 13.5px; }
+.syncbar .btn { padding: 4px 10px; }
+.libsync { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.libsync span { min-width: 0; }
+.field .row input[type="text"] { flex: 1; min-width: 0; }

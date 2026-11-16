@@ -71,7 +71,7 @@
   // Google Chirp 3 HD voice engine; tts stays null until a working key is saved
   let tts = null, claudeVoices = [], pgen = 0, pseq = 0, pcur = null, plines = new Map(), pline = null, plastMs = 0, pk = 1, pStarted = 0, pmark = 0;
   let gModels = [], gOcrModel = '', ocrJob = null, ocrCtl = null, pPaused = null, gAll = [], wired = false;
-  let libRef = null, chunkCol = null, remote = null, syncLive = false, syncChain = Promise.resolve(), syncJobs = Promise.resolve(), syncBusy = new Set(), posTimer = null, posDirty = false;
+  let gdrive = ls.get('lectern.drive', null), syncChain = Promise.resolve(), syncTimer = null, posDirty = false, firstSync = true, booksReady = null, syncing = false;
   let playing = false, tok = 0, timers = [], words = [], wordOn = null, activeEl = null, keep = null;
 
   const reader = $('reader'), stage = $('stage');
@@ -297,7 +297,7 @@
     if (existing) {
       const starts = new Set(chapters.map(c => c.pg));
       existing.chapters = existing.chapters.filter(c => !starts.has(c.pg)).concat(chapters).sort((x, y) => (x.pg || 0) - (y.pg || 0));
-      existing.synced = false;
+      existing.synced = false; existing.updated = Date.now();
       await idb('readwrite', s => s.put(existing));
       syncSoon(existing);
       if (book.id === existing.id) openBook(existing.id); else renderBooks();
@@ -477,7 +477,7 @@
           if (del.dataset.sure !== '1') { del.dataset.sure = '1'; del.textContent = 'Remove for good?'; setTimeout(() => { del.dataset.sure = ''; del.textContent = 'Remove'; }, 3500); return; }
           books = books.filter(x => x.id !== b.id); delete positions[b.id]; ls.set('lectern.pos', positions);
           await idb('readwrite', s => s.delete(b.id));
-          if (b.synced) { ls.set('lectern.tomb', ls.get('lectern.tomb', []).concat(b.id)); if (syncLive) reconcile(false); }
+          if (gdrive) { const t = readTombs(); t[b.id] = Date.now(); ls.set('lectern.tomb', t); syncSoon(); }
           if (book.id === b.id) openBook(books[0].id); else renderBooks();
         };
         li.appendChild(del);
@@ -487,9 +487,8 @@
   }
 
   /* ---------- backup ---------- */
-  const syncSoon = () => {}, schedulePos = () => {}, reconcile = () => {};
   function exportBackup() {
-    const data = { lectern: 1, saved: new Date().toISOString(), positions, books: books.filter(b => !b.sample) };
+    const data = { lectern: 1, saved: new Date().toISOString(), positions, books: books.filter(b => !b.sample).map(b => { const c = Object.assign({}, b); delete c.synced; return c; }) };
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
     a.download = 'lectern-library.json'; document.body.appendChild(a); a.click(); a.remove();
@@ -499,15 +498,194 @@
     try {
       const data = JSON.parse(await file.text());
       if (!data || data.lectern !== 1 || !Array.isArray(data.books)) throw new Error('That file is not a Lectern library backup.');
-      let n = 0;
+      let n = 0; const tombs = readTombs();
       for (const b of data.books) {
         if (!b || !b.id || !Array.isArray(b.chapters) || books.some(x => x.id === b.id)) continue;
+        delete b.synced; b.updated = Date.now(); delete tombs[b.id]; // a restored book counts as added again, here and on other devices
         books.push(b); await idb('readwrite', st => st.put(b)); n++;
       }
+      ls.set('lectern.tomb', tombs);
       for (const id in data.positions || {}) { const r = data.positions[id], l = positions[id]; if (!l || (r.t || 0) > (l.t || 0)) positions[id] = r; }
-      ls.set('lectern.pos', positions); renderBooks();
+      ls.set('lectern.pos', positions); renderBooks(); syncSoon();
       status(n ? `Restored ${n} book${n === 1 ? '' : 's'} and your reading positions.` : 'Every book in that backup is already here. Reading positions were updated.');
     } catch (e) { status(e.message || 'That backup could not be read.', true); }
+  }
+
+  /* ---------- sync through the reader's own Google Drive ---------- */
+  // Paste the OAuth client ID between the quotes to build it in for every device; the Settings box overrides it.
+  const DRIVE_CLIENT_ID = '';
+  const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+  const GIS = 'https://accounts.google.com/gsi/client';
+  const SyncLib = window.LecternSync;
+  const driveClient = () => (settings.driveClient || DRIVE_CLIENT_ID || '').trim();
+  const tokenOk = () => !!(gdrive && gdrive.token && gdrive.exp > Date.now());
+  const saveDrive = () => ls.set('lectern.drive', gdrive);
+  const standalone = () => !!(navigator.standalone || (window.matchMedia && matchMedia('(display-mode: standalone)').matches));
+  const appUrl = () => new URL('./', location.href).href;
+  function readTombs() { const t = ls.get('lectern.tomb', {}); if (Array.isArray(t)) { const o = {}; t.forEach(id => { o[id] = Date.now(); }); return o; } return t || {}; }
+  const drv = SyncLib && SyncLib.createDrive(() => tokenOk() ? gdrive.token : '');
+  const store = {
+    books: () => books.filter(b => !b.sample),
+    positions: () => positions,
+    tombs: readTombs,
+    async putBook(b) {
+      const i = books.findIndex(x => x.id === b.id);
+      if (i >= 0) books[i] = b; else books.push(b);
+      await idb('readwrite', s => s.put(b));
+    },
+    async dropBook(id) { books = books.filter(x => x.id !== id); await idb('readwrite', s => s.delete(id)); },
+    async markSynced(id, v) {
+      const b = books.find(x => x.id === id);
+      if (!b || SyncLib.bookVersion(b) > v) return; // changed again while it was uploading: send it next time
+      b.updated = v; b.synced = true; await idb('readwrite', s => s.put(b));
+    },
+    setPositions(p, tombs) { // keep any place this device moved to while the sync was running
+      const out = {};
+      for (const id of new Set([...Object.keys(p), ...Object.keys(positions)])) {
+        if (tombs[id]) continue;
+        const a = p[id], b = positions[id];
+        out[id] = !a ? b : !b ? a : ((b.t || 0) > (a.t || 0) ? b : a);
+      }
+      positions = out; ls.set('lectern.pos', positions);
+    },
+    clearTombs(ids) { const t = readTombs(); ids.forEach(id => delete t[id]); ls.set('lectern.tomb', t); }
+  };
+
+  function syncSoon(ms) {
+    if (!gdrive || !tokenOk()) { renderSync(); return; }
+    clearTimeout(syncTimer); syncTimer = setTimeout(() => sync(), typeof ms === 'number' ? ms : 2000);
+  }
+  function schedulePos(ms) { if (gdrive && tokenOk()) syncSoon(ms); }
+  function sync() {
+    syncChain = syncChain.then(syncOnce, syncOnce);
+    return syncChain;
+  }
+  async function syncOnce() {
+    if (!gdrive || !drv) return;
+    if (!tokenOk()) { renderSync(); return; }
+    if (navigator.onLine === false) { gdrive.err = 'offline'; renderSync(); return; }
+    await booksReady;
+    syncing = true; renderSync(); posDirty = false;
+    const wasBook = book.id, wasPos = positions[book.id] && Object.assign({}, positions[book.id]);
+    try {
+      const r = await SyncLib.runSync(drv, store);
+      gdrive.last = Date.now(); gdrive.err = '';
+      afterSync(r, wasBook, wasPos);
+    } catch (e) {
+      if (e.code === 'auth') { gdrive.token = ''; gdrive.err = ''; }
+      else gdrive.err = e.code === 'offline' ? 'offline' : (e.message || 'Sync did not finish.');
+    }
+    syncing = false; saveDrive(); renderSync();
+  }
+  function afterSync(r, wasBook, wasPos) {
+    const first = firstSync; firstSync = false;
+    if (!books.some(b => b.id === book.id)) { openBook(books[0].id); }
+    else if (!playing) {
+      const cur = books.find(b => b.id === book.id), p = positions[book.id];
+      const newer = p && r.pulled.includes(book.id) && (!wasPos || (p.t || 0) > (wasPos.t || 0)) && (p.c !== ci || p.s !== si);
+      let latest = null; // on opening the app, carry on with whichever book was read most recently on any device
+      if (first) for (const id in positions) if (books.some(b => b.id === id) && (!latest || (positions[id].t || 0) > (positions[latest].t || 0))) latest = id;
+      if (first && latest && latest !== book.id && r.pulled.includes(latest) && (positions[latest].t || 0) > ((wasPos && wasPos.t) || 0)) {
+        openBook(latest); toast('Picked up where you left off on another device.');
+      } else if (newer || (cur !== book && r.downloadedIds.includes(book.id))) {
+        openBook(book.id); if (newer) toast('Picked up where you left off on another device.');
+      }
+    }
+    if (r.downloaded || r.removed) {
+      const parts = [];
+      if (r.downloaded) parts.push(`${r.downloaded} book${r.downloaded === 1 ? '' : 's'} from your other devices`);
+      if (r.removed) parts.push(`${r.removed} removed elsewhere`);
+      if (!$('libraryDlg').open) toast('Library synced: ' + parts.join(', ') + '.');
+    }
+    renderBooks();
+  }
+
+  function onToken(token, expiresIn) {
+    const prev = gdrive && gdrive.email;
+    gdrive = Object.assign(gdrive || {}, { token, exp: Date.now() + (Math.max(60, +expiresIn || 3600) - 120) * 1000, err: '' });
+    saveDrive(); renderSync();
+    return drv.about().then(async a => {
+      const email = (a && a.user && a.user.emailAddress) || '';
+      if (prev && email && prev !== email) { // a different Google account: merge into it rather than mirror the old one
+        for (const b of books) if (b.synced) { b.synced = false; await idb('readwrite', s => s.put(b)); }
+      }
+      gdrive.email = email; gdrive.name = (a && a.user && a.user.displayName) || ''; saveDrive();
+    }).catch(() => {}).then(() => sync());
+  }
+  function syncSay(msg, err) { const el = $('syncStatus'); el.textContent = msg; el.classList.toggle('err', !!err); }
+  async function signIn() {
+    const id = driveClient();
+    if (!id) { $('syncSetup').open = true; syncSay('Add your Google client ID first (see the setup steps below).', true); return; }
+    if (navigator.onLine === false) { syncSay('Connect to the internet to sign in to Google.', true); return; }
+    if (standalone()) { // home screen apps cannot use Google's sign-in window, so go to Google and come back
+      const state = Math.random().toString(36).slice(2) + Date.now().toString(36);
+      ls.set('lectern.oauthState', state);
+      const q = new URLSearchParams({ client_id: id, redirect_uri: appUrl(), response_type: 'token', scope: DRIVE_SCOPE, include_granted_scopes: 'true', state });
+      if (gdrive && gdrive.email) q.set('login_hint', gdrive.email);
+      stop(); location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + q;
+      return;
+    }
+    try {
+      if (!(window.google && google.accounts && google.accounts.oauth2)) await loadScript(GIS).catch(() => { throw new Error('Could not reach Google sign-in. Check your connection and try again.'); });
+      const known = gdrive && gdrive.email;
+      const res = await new Promise((ok, no) => {
+        const c = google.accounts.oauth2.initTokenClient({
+          client_id: id, scope: DRIVE_SCOPE,
+          callback: r => r && r.access_token ? ok(r) : no(r || {}),
+          error_callback: e => no(e || {})
+        });
+        c.requestAccessToken(known ? { prompt: '', hint: known } : { prompt: 'consent' });
+      });
+      if (!google.accounts.oauth2.hasGrantedAllScopes(res, DRIVE_SCOPE)) { syncSay('Google did not allow Drive access. Sign in again and tick the Drive box.', true); return; }
+      await onToken(res.access_token, res.expires_in);
+    } catch (e) {
+      const t = e && (e.type || e.error);
+      syncSay(t === 'popup_failed_to_open' ? 'Your browser blocked the Google window. Allow pop-ups for this site, then press the button again.'
+        : t === 'popup_closed' || t === 'access_denied' ? 'Sign-in was cancelled.'
+        : t === 'invalid_client' || /client/i.test(String(e && e.error_description || '')) ? 'Google did not recognise that client ID. Check it in the setup steps below.'
+        : (e && e.message) || 'Google sign-in did not finish. Try again.', true);
+    }
+  }
+  function takeRedirect() { // the answer from Google after signing in from a home screen app
+    if (!/(^|[#&])(access_token|error)=/.test(location.hash)) return null;
+    const h = new URLSearchParams(location.hash.slice(1));
+    history.replaceState(null, '', location.pathname + location.search);
+    const want = ls.get('lectern.oauthState', ''); ls.set('lectern.oauthState', '');
+    if (!want || h.get('state') !== want) return null;
+    if (h.get('access_token')) return { token: h.get('access_token'), exp: h.get('expires_in') };
+    return { error: h.get('error') };
+  }
+  async function signOut() {
+    const t = gdrive && gdrive.token;
+    clearTimeout(syncTimer);
+    gdrive = null; ls.set('lectern.drive', null); ls.set('lectern.tomb', {});
+    for (const b of books) if (b.synced) { b.synced = false; await idb('readwrite', s => s.put(b)); }
+    if (t) fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(t), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }).catch(() => {});
+    renderSync(); renderBooks();
+    syncSay('Signed out. Your books stay on this device, and the copy in your Google Drive is kept.');
+  }
+  function ago(t) {
+    const s = (Date.now() - t) / 1000;
+    return s < 60 ? 'just now' : s < 3600 ? Math.round(s / 60) + ' min ago' : s < 86400 ? Math.round(s / 3600) + ' h ago' : new Date(t).toLocaleDateString();
+  }
+  function renderSync() {
+    const on = !!gdrive, live = tokenOk();
+    $('syncIn').hidden = on && live; $('syncIn').textContent = on ? 'Reconnect to Google' : 'Sign in with Google';
+    $('syncNow').hidden = !(on && live); $('syncOut').hidden = !on;
+    $('libSync').hidden = !on;
+    let line, err = false;
+    if (!on) line = driveClient() ? 'Sign in to keep your library and reading positions the same on every device.' : 'Not set up yet. Sync needs a one-time Google setup, below.';
+    else if (syncing) line = 'Syncing with Google Drive…';
+    else if (!live) line = `Sync is paused until you reconnect${gdrive.email ? ' as ' + gdrive.email : ''}. Changes here are kept and sent when you do.`;
+    else if (gdrive.err === 'offline') line = 'Offline. Changes are kept here and sync when you are back online.';
+    else if (gdrive.err) { line = gdrive.err; err = true; }
+    else line = `Synced with ${gdrive.email || 'your Google Drive'}${gdrive.last ? ' · ' + ago(gdrive.last) : ''}.`;
+    const el = $('syncStatus'); el.textContent = line; el.classList.toggle('err', err);
+    $('libSyncMsg').textContent = !on ? '' : line;
+    $('libSyncBtn').textContent = live ? 'Sync now' : 'Reconnect';
+    $('libSyncBtn').disabled = syncing;
+    $('syncBar').hidden = !(on && !live);
+    $('libNote').textContent = on ? 'Books and reading positions sync through your Google Drive. A backup file still works too.' : 'Books live in this browser. Sign in to Google in Settings to sync every device, or use a backup file.';
   }
 
   /* ---------- Google Cloud: Chirp 3 HD speech and Vision page reading ---------- */
@@ -1105,7 +1283,10 @@
     if (String(window.getSelection && window.getSelection()).length) return;
     jump(+s.dataset.i);
   });
-  $('libraryBtn').onclick = () => { status(''); renderBooks(); $('libraryDlg').showModal(); };
+  $('libraryBtn').onclick = () => {
+    status(''); renderBooks(); renderSync(); $('libraryDlg').showModal();
+    if (gdrive && driveClient() && navigator.onLine !== false) { if (tokenOk()) syncSoon(0); else if (!standalone()) signIn(); } // opening the library brings in other devices' books
+  };
   $('displayBtn').onclick = () => $('displayDlg').showModal();
   document.querySelectorAll('dialog.sheet').forEach(d => {
     d.querySelector('[data-close]').onclick = () => d.close();
@@ -1162,6 +1343,25 @@
   $('gStyle').onchange = e => { settings.gstyle = e.target.value.trim(); saveSettings(); restartIfPlaying(); };
   $('gOffline').onclick = prepareChapter;
   $('gClear').onclick = async () => { await idb('readwrite', st => st.clear(), 'audio'); gStatus('Saved audio was cleared from this device.'); };
+  $('syncIn').onclick = signIn;
+  $('syncBarBtn').onclick = signIn;
+  $('syncNow').onclick = () => sync();
+  $('libSyncBtn').onclick = () => tokenOk() ? sync() : signIn();
+  $('syncOut').onclick = () => { if ($('syncOut').dataset.sure !== '1') { $('syncOut').dataset.sure = '1'; $('syncOut').textContent = 'Sign out of sync?'; setTimeout(() => { $('syncOut').dataset.sure = ''; $('syncOut').textContent = 'Sign out'; }, 3500); return; } $('syncOut').dataset.sure = ''; $('syncOut').textContent = 'Sign out'; signOut(); };
+  $('syncClientSave').onclick = () => {
+    const v = $('syncClient').value.trim();
+    if (v && !/^[\w-]+\.apps\.googleusercontent\.com$/.test(v)) { syncSay('That does not look like a client ID. It ends in .apps.googleusercontent.com.', true); return; }
+    settings.driveClient = v; saveSettings(); renderSync();
+    if (v) { loadScript(GIS).catch(() => {}); syncSay('Client ID saved. Now press Sign in with Google.'); }
+  };
+  $('displayBtn').addEventListener('click', () => { renderSync(); if (driveClient() && !standalone()) loadScript(GIS).catch(() => {}); });
+  document.addEventListener('visibilitychange', () => {
+    if (!gdrive || !tokenOk()) { if (document.visibilityState === 'visible') renderSync(); return; }
+    if (document.visibilityState === 'hidden') { if (posDirty) sync(); }
+    else if (!gdrive.last || Date.now() - gdrive.last > 60000) syncSoon(500);
+  });
+  window.addEventListener('online', () => { if (gdrive && tokenOk()) syncSoon(500); });
+  setInterval(() => { if (gdrive && tokenOk() && document.visibilityState === 'visible') sync(); else if (gdrive) renderSync(); }, 180000);
   $('exportBtn').onclick = exportBackup;
   $('importBtn').onclick = () => $('backupIn').click();
   $('backupIn').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) importBackup(f); };
@@ -1180,7 +1380,10 @@
   initGoogle();
   setupMedia();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
-  idb('readonly', s => s.getAll()).then(saved => {
+  const back = takeRedirect();
+  $('syncClient').value = settings.driveClient || '';
+  if (/^https:|localhost/.test(location.origin)) { $('syncOrigin').textContent = location.origin; $('syncRedirect').textContent = appUrl(); }
+  booksReady = idb('readonly', s => s.getAll()).then(saved => {
     if (saved && saved.length) {
       saved.sort((a, b) => (a.added || 0) - (b.added || 0));
       books = [SAMPLE, ...saved];
@@ -1188,4 +1391,9 @@
       if (last && last !== SAMPLE.id && books.some(b => b.id === last)) openBook(last); else renderBooks();
     }
   });
+  renderSync();
+  if (back && back.token) booksReady.then(() => onToken(back.token, back.exp));
+  else if (back && back.error) toast(back.error === 'access_denied' ? 'Sign-in was cancelled.' : 'Google sign-in did not finish. Try again in Settings.', true);
+  else if (gdrive && tokenOk()) sync();
+  if (gdrive && driveClient() && !standalone()) loadScript(GIS).catch(() => {});
 })();
