@@ -1129,11 +1129,11 @@
     catch (e) { status(e.message, true); }
   };
   let dragDepth = 0;
-  window.addEventListener('dragenter', e => { if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) { dragDepth++; $('drop').classList.add('over'); } });
-  window.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $('drop').classList.remove('over'); });
+  window.addEventListener('dragenter', e => { if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) { dragDepth++; $('drop').classList.add('over'); $('dragVeil').classList.add('on'); } });
+  window.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) { $('drop').classList.remove('over'); $('dragVeil').classList.remove('on'); } });
   window.addEventListener('dragover', e => e.preventDefault());
   window.addEventListener('drop', e => {
-    e.preventDefault(); dragDepth = 0; $('drop').classList.remove('over');
+    e.preventDefault(); dragDepth = 0; $('drop').classList.remove('over'); $('dragVeil').classList.remove('on');
     const fs = e.dataTransfer ? Array.from(e.dataTransfer.files) : [];
     if (fs.length) { if (!$('libraryDlg').open) $('libraryDlg').showModal(); importFiles(fs); }
   });
