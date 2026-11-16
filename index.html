@@ -108,6 +108,10 @@
     <div class="field">
       <h4>Natural voices · Google</h4>
       <div class="row"><input type="password" id="gKey" placeholder="Google API key" aria-label="Google API key" autocomplete="off" spellcheck="false"><button class="btn primary" id="gSave" type="button">Save</button></div>
+      <div class="row2" id="gKeyBtns" hidden>
+        <button class="btn quiet" id="gRemoveHere" type="button">Remove key</button>
+        <button class="btn quiet" id="gRemoveAll" type="button" hidden>Remove from all devices</button>
+      </div>
       <p class="status" id="gStatus" role="status"></p>
       <label class="stack" for="gEngine">Voice engine<select id="gEngine"></select></label>
       <label class="stack" id="gStyleWrap" for="gStyle">Narration style (Gemini voices)<input type="text" id="gStyle" maxlength="200"></label>
@@ -124,7 +128,7 @@
           <li>Paste the key above and press Save. The app lists the speech models your key offers and picks the cheapest.</li>
           <li>Optional: for Chirp 3 HD as well, enable the <b>Cloud Text-to-Speech API</b> in the same Google Cloud project.</li>
         </ol>
-        <p>The key is kept only in this browser and is sent only to Google. Usage beyond Google’s free allowance is billed to the key’s project; see <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener">Google’s pricing</a>.</p>
+        <p>The key is kept in this browser and is sent only to Google. When you sign in to sync below, it is also kept in your Google Drive’s private app folder, so your other devices get it along with your voice, engine, narration style and speed. Usage beyond Google’s free allowance is billed to the key’s project; see <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener">Google’s pricing</a>.</p>
       </details>
     </div>
     <div class="field" id="syncField">

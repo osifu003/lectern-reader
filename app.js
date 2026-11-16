@@ -62,7 +62,8 @@
   let persistOk = true;
 
   /* ---------- state ---------- */
-  const settings = Object.assign({ font: 'book', size: 20, lh: 1.7, width: 66, word: true, focus: false, scroll: true, voice: true, rate: 1, voiceURI: '', gkey: '', glang: '', gengine: '', gstyle: 'Read this aloud as a warm, natural audiobook narrator:', theme: 'auto' }, ls.get('lectern.settings', {}));
+  const DEFAULTS = { font: 'book', size: 20, lh: 1.7, width: 66, word: true, focus: false, scroll: true, voice: true, rate: 1, voiceURI: '', gkey: '', glang: '', gengine: '', gstyle: 'Read this aloud as a warm, natural audiobook narrator:', theme: 'auto' };
+  const settings = Object.assign({}, DEFAULTS, ls.get('lectern.settings', {}));
   let positions = ls.get('lectern.pos', {});
   let books = [SAMPLE];
   let book = SAMPLE, ci = 0, si = 0;
@@ -548,8 +549,67 @@
       }
       positions = out; ls.set('lectern.pos', positions);
     },
-    clearTombs(ids) { const t = readTombs(); ids.forEach(id => delete t[id]); ls.set('lectern.tomb', t); }
+    clearTombs(ids) { const t = readTombs(); ids.forEach(id => delete t[id]); ls.set('lectern.tomb', t); },
+    prefs: () => ({ values: Object.fromEntries(PREF_KEYS.map(k => [k, { v: prefValue(k), t: prefT[k] || 0 }])), skip: prefsLocal() }),
+    async setPrefs(pulled) { applyPulledPrefs(pulled); }
   };
+
+  /* ---------- the Google key and voice settings follow you through the same sync ---------- */
+  // Each shared setting remembers when it was last changed by hand; the newest change wins on every device.
+  const PREF_KEYS = (SyncLib && SyncLib.PREF_KEYS) || ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate'];
+  const VOICE_KEYS = ['gkey', 'gengine', 'glang', 'voiceURI'];
+  const prefValue = k => k === 'voiceURI' && !/^[gm]:/.test(settings.voiceURI) ? '' : settings[k]; // this device's own built-in voices stay here
+  let prefT = ls.get('lectern.prefT', null);
+  if (!prefT) { // first run with shared settings: anything already chosen here counts as an old change, so a fresh device takes it but no real change loses to it
+    prefT = {};
+    for (const k of PREF_KEYS) if (prefValue(k) !== DEFAULTS[k] && prefValue(k) !== '') prefT[k] = 1;
+    ls.set('lectern.prefT', prefT);
+  }
+  function prefsLocal() { const v = ls.get('lectern.prefsLocal', []); return Array.isArray(v) ? v : []; }
+  function setPrefLocal(k, on) { const v = prefsLocal().filter(x => x !== k); if (on) v.push(k); ls.set('lectern.prefsLocal', v); }
+  function stampPref(...keys) { // a change made by hand: send it to the other devices
+    const t = Date.now();
+    for (const k of keys) prefT[k] = t; // choosing one of this device's own voices shares an empty voice, which other devices ignore
+    ls.set('lectern.prefT', prefT); syncSoon();
+  }
+  function applyPulledPrefs(pulled) {
+    const changed = [];
+    for (const k in pulled) {
+      if (!PREF_KEYS.includes(k)) continue;
+      prefT[k] = pulled[k].t;
+      let v = pulled[k].v;
+      if (k === 'rate') { v = +v; if (!(v > 0)) continue; }
+      else v = v == null ? '' : String(v);
+      if (k === 'voiceURI' && !v) continue; // an empty shared voice leaves this device's own choice alone
+      if (settings[k] !== v) { settings[k] = v; changed.push(k); }
+    }
+    ls.set('lectern.prefT', prefT);
+    if (!changed.length) return;
+    saveSettings();
+    $('gKey').value = settings.gkey; $('gStyle').value = settings.gstyle;
+    if (changed.includes('rate')) { applySettings(); updateProgress(); if (premium()) syncRate(); }
+    if (changed.some(k => VOICE_KEYS.includes(k))) {
+      chunkCache = new Map();
+      initGoogle().then(() => restartIfPlaying());
+    } else if (changed.includes('gstyle')) restartIfPlaying();
+    toast(changed.includes('gkey') ? (settings.gkey ? 'Your Google key and voice settings arrived from your other devices.' : 'Your Google key was removed on another device.') : 'Voice settings updated from your other devices.');
+  }
+  function renderKeyBtns() {
+    const has = !!settings.gkey;
+    $('gKeyBtns').hidden = !has;
+    $('gRemoveHere').textContent = gdrive ? 'Remove from this device' : 'Remove key';
+    $('gRemoveAll').hidden = !gdrive;
+  }
+  function removeKey(everywhere) {
+    settings.gkey = ''; $('gKey').value = ''; saveSettings();
+    if (everywhere) { setPrefLocal('gkey', false); stampPref('gkey'); }
+    else setPrefLocal('gkey', true); // keep the copy in Drive for the other devices, and don't take it back here
+    initGoogle(true).then(() => {
+      gStatus(everywhere ? 'Key removed. Your other devices remove it the next time they sync.'
+        : gdrive ? 'Key removed from this device only. Your other devices keep it. Save a key here to share it again.' : 'Key removed from this device.');
+      renderKeyBtns();
+    });
+  }
 
   function syncSoon(ms) {
     if (!gdrive || !tokenOk()) { renderSync(); return; }
@@ -662,7 +722,7 @@
     for (const b of books) if (b.synced) { b.synced = false; await idb('readwrite', s => s.put(b)); }
     if (t) fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(t), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }).catch(() => {});
     renderSync(); renderBooks();
-    syncSay('Signed out. Your books stay on this device, and the copy in your Google Drive is kept.');
+    syncSay('Signed out. Your books and Google key stay on this device, and the copy in your Google Drive is kept.');
   }
   function ago(t) {
     const s = (Date.now() - t) / 1000;
@@ -674,7 +734,7 @@
     $('syncNow').hidden = !(on && live); $('syncOut').hidden = !on;
     $('libSync').hidden = !on;
     let line, err = false;
-    if (!on) line = driveClient() ? 'Sign in to keep your library and reading positions the same on every device.' : 'Not set up yet. Sync needs a one-time Google setup, below.';
+    if (!on) line = driveClient() ? 'Sign in to keep your library, reading positions, Google key and voice settings the same on every device.' : 'Not set up yet. Sync needs a one-time Google setup, below.';
     else if (syncing) line = 'Syncing with Google Drive…';
     else if (!live) line = `Sync is paused until you reconnect${gdrive.email ? ' as ' + gdrive.email : ''}. Changes here are kept and sent when you do.`;
     else if (gdrive.err === 'offline') line = 'Offline. Changes are kept here and sync when you are back online.';
@@ -685,7 +745,8 @@
     $('libSyncBtn').textContent = live ? 'Sync now' : 'Reconnect';
     $('libSyncBtn').disabled = syncing;
     $('syncBar').hidden = !(on && !live);
-    $('libNote').textContent = on ? 'Books and reading positions sync through your Google Drive. A backup file still works too.' : 'Books live in this browser. Sign in to Google in Settings to sync every device, or use a backup file.';
+    renderKeyBtns();
+    $('libNote').textContent = on ? 'Books, reading positions, your Google key and voice settings sync through your Google Drive. A backup file still works too.' : 'Books live in this browser. Sign in to Google in Settings to sync every device, or use a backup file.';
   }
 
   /* ---------- Google Cloud: Chirp 3 HD speech and Vision page reading ---------- */
@@ -877,7 +938,7 @@
     if (!claudeVoices.length && premiumNow) settings.voiceURI = '';
   }
   async function initGoogle(fromButton) {
-    addUsage(0);
+    addUsage(0); renderKeyBtns();
     $('gStyle').value = settings.gstyle;
     if (!settings.gkey) {
       tts = null; gAll = []; gModels = []; gOcrModel = ''; buildEngines(); applySettings(); loadVoices();
@@ -1313,10 +1374,10 @@
   $('prevCh').onclick = () => goChapter(ci - 1);
   $('nextCh').onclick = () => goChapter(ci + 1);
   $('rateSel').onchange = e => {
-    settings.rate = +e.target.value; saveSettings(); updateProgress();
+    settings.rate = +e.target.value; saveSettings(); stampPref('rate'); updateProgress();
     if (premium()) syncRate(); else restartIfPlaying(); // Chirp audio changes pace without restarting
   };
-  $('voiceSel').onchange = e => { settings.voiceURI = e.target.value; chunkCache = new Map(); saveSettings(); note(''); syncRate(); restartIfPlaying(); };
+  $('voiceSel').onchange = e => { settings.voiceURI = e.target.value; chunkCache = new Map(); saveSettings(); stampPref('voiceURI'); note(''); syncRate(); restartIfPlaying(); };
   reader.addEventListener('click', e => {
     const s = e.target.closest('.s'); if (!s) return;
     if (String(window.getSelection && window.getSelection()).length) return;
@@ -1376,10 +1437,20 @@
   window.addEventListener('pagehide', () => { try { synth && synth.cancel(); } catch {} });
 
   $('themeSel').onchange = e => { settings.theme = e.target.value; saveSettings(); applySettings(); };
-  $('gSave').onclick = () => { settings.gkey = $('gKey').value.trim(); saveSettings(); initGoogle(true); };
-  $('gLang').onchange = e => { settings.glang = e.target.value; buildEngines(); saveSettings(); loadVoices(); restartIfPlaying(); };
-  $('gEngine').onchange = e => { settings.gengine = e.target.value; buildEngines(true); saveSettings(); loadVoices(); restartIfPlaying(); };
-  $('gStyle').onchange = e => { settings.gstyle = e.target.value.trim(); saveSettings(); restartIfPlaying(); };
+  $('gSave').onclick = () => {
+    const k = $('gKey').value.trim();
+    if (!k) { if (settings.gkey) removeKey(false); return; } // an empty box only clears this device
+    settings.gkey = k; saveSettings(); setPrefLocal('gkey', false); stampPref('gkey'); initGoogle(true);
+  };
+  $('gRemoveHere').onclick = () => removeKey(false);
+  $('gRemoveAll').onclick = () => {
+    const b = $('gRemoveAll');
+    if (b.dataset.sure !== '1') { b.dataset.sure = '1'; b.textContent = 'Remove from every device?'; setTimeout(() => { b.dataset.sure = ''; b.textContent = 'Remove from all devices'; }, 3500); return; }
+    b.dataset.sure = ''; b.textContent = 'Remove from all devices'; removeKey(true);
+  };
+  $('gLang').onchange = e => { settings.glang = e.target.value; buildEngines(); saveSettings(); stampPref('glang', 'voiceURI'); loadVoices(); restartIfPlaying(); };
+  $('gEngine').onchange = e => { settings.gengine = e.target.value; buildEngines(true); saveSettings(); stampPref('gengine', 'voiceURI'); loadVoices(); restartIfPlaying(); };
+  $('gStyle').onchange = e => { settings.gstyle = e.target.value.trim(); saveSettings(); stampPref('gstyle'); restartIfPlaying(); };
   $('gOffline').onclick = prepareChapter;
   $('gClear').onclick = async () => { await idb('readwrite', st => st.clear(), 'audio'); gStatus('Saved audio was cleared from this device.'); };
   $('syncIn').onclick = signIn;

@@ -4,6 +4,9 @@
   'use strict';
 
   const STATE = 'state.json';
+  const PREFS = 'prefs.json';
+  // Voice settings that follow the reader to every device; display settings stay per device.
+  const PREF_KEYS = ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate'];
   const TOMB_DAYS = 180;
   const bookName = id => 'book-' + id + '.json';
   const bookVersion = b => b.updated || b.added || 0;
@@ -34,6 +37,29 @@
     if (!o || typeof o !== 'object') return o;
     const out = {}; Object.keys(o).sort().forEach(k => { out[k] = sortKeys(o[k]); }); return out;
   }
+
+  // Settings: each field carries the time it was last changed by hand ({v, t}); the newest change wins, field by field.
+  // On a tie a set value beats an empty one, otherwise nothing moves (so automatic adjustments never ping-pong).
+  // skip: fields this device keeps to itself (neither sent nor taken). Fields this version does not know are kept on Drive.
+  function mergePrefs(local, remote, skip) {
+    local = local || {}; remote = remote || {};
+    const no = new Set(skip || []), empty = x => !x || x.v === '' || x.v == null;
+    const prefs = {}, pulled = {};
+    let remoteChanged = false;
+    for (const k of new Set([...Object.keys(local), ...Object.keys(remote)])) {
+      const l = local[k], r = remote[k];
+      if (no.has(k) || !l) { if (r) prefs[k] = r; continue; }
+      if (!r) { prefs[k] = l; remoteChanged = true; continue; }
+      const lt = +l.t || 0, rt = +r.t || 0;
+      const take = rt > lt || (rt === lt && empty(l) && !empty(r));
+      const give = lt > rt || (rt === lt && empty(r) && !empty(l));
+      if (take) { prefs[k] = r; if (!sameVal(l.v, r.v) || lt !== rt) pulled[k] = { v: r.v, t: rt }; }
+      else if (give) { prefs[k] = l; remoteChanged = true; }
+      else prefs[k] = r;
+    }
+    return { prefs, pulled, remoteChanged };
+  }
+  const sameVal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
   // Decide what moves where. local: [{id, v, synced}]; remote: [{fileId, id, v, modified}]; tombs: merged tombstones {id: time}.
   function planSync(local, remote, tombs) {
@@ -117,7 +143,8 @@
   }
 
   // One full pass: list Drive, merge positions and deletions, move books both ways.
-  // store: { books(), positions(), tombs(), putBook(b), dropBook(id), markSynced(id, v), setPositions(p, tombs), clearTombs(ids) }
+  // store: { books(), positions(), tombs(), putBook(b), dropBook(id), markSynced(id, v), setPositions(p, tombs), clearTombs(ids),
+  //         prefs() -> { values: {k: {v, t}}, skip: [k] }, setPrefs({k: {v, t}}) } (the last two optional)
   async function runSync(drive, store, now) {
     const files = await drive.list();
     const stateFile = files.find(f => f.name === STATE);
@@ -152,9 +179,19 @@
     }
     if (merged.localChanged) store.setPositions(merged.positions, merged.tombs);
     store.clearTombs(Object.keys(localTombs));
+
+    if (store.prefs) { // voice settings and the Google key, in their own file so older app versions never overwrite them
+      const pf = files.find(f => f.name === PREFS);
+      const remote = pf ? await drive.read(pf.id).catch(e => { if (e.code === 'missing') return {}; throw e; }) : {};
+      const lp = store.prefs();
+      const m = mergePrefs(lp.values, (remote && remote.prefs) || {}, lp.skip);
+      if (m.remoteChanged || !pf) await drive.write(pf ? pf.id : '', PREFS, { lectern: 1, prefs: m.prefs }, { kind: 'prefs' });
+      result.prefs = Object.keys(m.pulled);
+      if (result.prefs.length) await store.setPrefs(m.pulled);
+    }
     return result;
   }
 
-  const api = { mergeState, planSync, createDrive, runSync, bookVersion, STATE };
+  const api = { mergeState, mergePrefs, planSync, createDrive, runSync, bookVersion, STATE, PREFS, PREF_KEYS };
   if (typeof module === 'object' && module.exports) module.exports = api; else root.LecternSync = api;
 })(typeof self !== 'undefined' ? self : this);
