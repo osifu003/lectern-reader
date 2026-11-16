@@ -1,5 +1,5 @@
 // Keeps the app itself available offline. Books and saved audio live in the browser's own storage, not here.
-const CACHE = 'lectern-v4';
+const CACHE = 'lectern-v5';
 const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'sync.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'vendor/jszip.min.js', 'vendor/pdf.min.js', 'vendor/pdf.worker.min.js'];
 
