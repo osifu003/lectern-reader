@@ -35,7 +35,9 @@ billed to the key's project.
 
 Books, chapters and reading positions can follow you to every device through your own Google Drive. They are
 kept in Drive's hidden app data folder (scope `drive.appdata`), which only this app can open; nothing goes to
-any other server. Saved audio, the API key and display settings stay on each device.
+any other server. Your Google API key and voice settings (voice engine, voice, language, narration style and
+speed) travel the same way, so a new device has them as soon as you sign in. Saved audio and display settings
+(font, size, theme, highlight options) stay on each device.
 
 One-time setup, on a computer:
 
@@ -55,7 +57,10 @@ disconnected or offline are kept and sent on the next sync.
 
 How sync decides: a book added on one device is uploaded and appears on the others; a book changed later (more
 scanned pages read) replaces the older copy; a book removed on one device is removed everywhere (kept for 180
-days as a deletion record); for each book the most recent reading position wins.
+days as a deletion record); for each book the most recent reading position wins. For the key and each voice setting, the most recent change
+made by hand on any device wins (kept in `prefs.json`). In Settings, "Remove from this device" clears the key here
+only (this device then stops taking it from Drive until you save a key here again); "Remove from all devices" clears
+it everywhere on their next sync. Signing out keeps the key on that device.
 
 ## Word highlight
 

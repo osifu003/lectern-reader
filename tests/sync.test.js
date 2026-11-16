@@ -158,3 +158,92 @@ test('expired sign-in and no connection are reported, not thrown away', async ()
   const none = S.createDrive(() => '', async () => { throw new Error('should not call'); });
   await assert.rejects(none.list(), e => e.code === 'auth');
 });
+
+// ---------- the Google key and voice settings ----------
+
+test('settings: the newest change wins, field by field', () => {
+  const m = S.mergePrefs(
+    { gkey: { v: 'K1', t: 10 }, gstyle: { v: 'warm', t: 50 }, rate: { v: 1, t: 0 } },
+    { gkey: { v: 'K2', t: 20 }, gstyle: { v: 'calm', t: 40 }, rate: { v: 1.5, t: 30 } });
+  assert.deepStrictEqual(m.pulled, { gkey: { v: 'K2', t: 20 }, rate: { v: 1.5, t: 30 } });
+  assert.strictEqual(m.prefs.gstyle.v, 'warm');
+  assert.ok(m.remoteChanged, 'the newer style goes up');
+});
+
+test('settings: a fresh device takes the key; on a tie a set value beats an empty one, and nothing else moves', () => {
+  const fresh = S.mergePrefs({ gkey: { v: '', t: 0 } }, { gkey: { v: 'K', t: 1 } });
+  assert.deepStrictEqual(fresh.pulled, { gkey: { v: 'K', t: 1 } });
+  const tieEmpty = S.mergePrefs({ gkey: { v: '', t: 1 } }, { gkey: { v: 'K', t: 1 } });
+  assert.deepStrictEqual(tieEmpty.pulled, { gkey: { v: 'K', t: 1 } });
+  const tieBoth = S.mergePrefs({ gengine: { v: 'm:a', t: 1 } }, { gengine: { v: 'm:b', t: 1 } });
+  assert.deepStrictEqual(tieBoth.pulled, {}); assert.ok(!tieBoth.remoteChanged, 'automatic differences never ping-pong');
+  const agree = S.mergePrefs({ gkey: { v: 'K', t: 5 } }, { gkey: { v: 'K', t: 5 } });
+  assert.ok(!agree.remoteChanged); assert.deepStrictEqual(agree.pulled, {});
+});
+
+test('settings: a removal made later wins, a field kept to this device is neither sent nor taken, unknown fields stay on Drive', () => {
+  const cleared = S.mergePrefs({ gkey: { v: 'K', t: 5 } }, { gkey: { v: '', t: 9 } });
+  assert.deepStrictEqual(cleared.pulled, { gkey: { v: '', t: 9 } });
+  const kept = S.mergePrefs({ gkey: { v: '', t: 99 }, rate: { v: 2, t: 99 } }, { gkey: { v: 'K', t: 5 }, future: { v: 'x', t: 1 } }, ['gkey']);
+  assert.deepStrictEqual(kept.pulled, {});
+  assert.deepStrictEqual(kept.prefs, { gkey: { v: 'K', t: 5 }, future: { v: 'x', t: 1 }, rate: { v: 2, t: 99 } });
+});
+
+function prefsDevice(initial, values, skip) {
+  const st = device(initial);
+  st.values = values || {}; st.skip = skip || [];
+  st.store.prefs = () => ({ values: JSON.parse(JSON.stringify(st.values)), skip: st.skip });
+  st.store.setPrefs = async p => { for (const k in p) st.values[k] = p[k]; };
+  return st;
+}
+const blank = () => ({ gkey: { v: '', t: 0 }, gengine: { v: '', t: 0 }, voiceURI: { v: '', t: 0 }, gstyle: { v: 'Read this aloud', t: 0 }, rate: { v: 1, t: 0 } });
+
+test('two devices: the key and voice from the desktop reach a new phone; a removal everywhere reaches it too', async () => {
+  const fd = fakeDrive(), drive = S.createDrive(() => 'tok', fd.fetchImpl);
+  const desktop = prefsDevice([], Object.assign(blank(), { gkey: { v: 'AIzaKEY', t: 1 }, gengine: { v: 'm:gemini-flash-lite-tts', t: 1 }, voiceURI: { v: 'm:Sulafat', t: 300 }, rate: { v: 1.25, t: 200 } }));
+  const phone = prefsDevice([], blank());
+
+  await S.runSync(drive, desktop.store, now);
+  const file = [...fd.files.values()].find(f => f.name === S.PREFS);
+  assert.ok(file, 'prefs.json is kept in the app data folder');
+  assert.strictEqual(JSON.parse(file.body).prefs.gkey.v, 'AIzaKEY');
+
+  let r = await S.runSync(drive, phone.store, now);
+  assert.deepStrictEqual(r.prefs.sort(), ['gengine', 'gkey', 'rate', 'voiceURI']);
+  assert.strictEqual(phone.values.gkey.v, 'AIzaKEY');
+  assert.strictEqual(phone.values.voiceURI.v, 'm:Sulafat');
+  assert.strictEqual(phone.values.rate.v, 1.25);
+  assert.strictEqual(phone.values.gstyle.v, 'Read this aloud', 'an untouched default stays as it is');
+
+  phone.values.voiceURI = { v: 'm:Kore', t: 500 }; // a new voice picked on the phone
+  await S.runSync(drive, phone.store, now);
+  r = await S.runSync(drive, desktop.store, now);
+  assert.deepStrictEqual(r.prefs, ['voiceURI']);
+  assert.strictEqual(desktop.values.voiceURI.v, 'm:Kore');
+
+  desktop.values.gkey = { v: '', t: 900 }; // removed from all devices
+  await S.runSync(drive, desktop.store, now);
+  await S.runSync(drive, phone.store, now);
+  assert.strictEqual(phone.values.gkey.v, '');
+});
+
+test('a key removed from one device only stays on Drive and on the others, and is not taken back there', async () => {
+  const fd = fakeDrive(), drive = S.createDrive(() => 'tok', fd.fetchImpl);
+  const desktop = prefsDevice([], Object.assign(blank(), { gkey: { v: 'K', t: 1 } }));
+  await S.runSync(drive, desktop.store, now);
+  const loaner = prefsDevice([], Object.assign(blank(), { gkey: { v: '', t: 50 } }), ['gkey']);
+  const r = await S.runSync(drive, loaner.store, now);
+  assert.ok(!r.prefs.includes('gkey'));
+  assert.strictEqual(loaner.values.gkey.v, '');
+  const onDrive = JSON.parse([...fd.files.values()].find(f => f.name === S.PREFS).body).prefs;
+  assert.strictEqual(onDrive.gkey.v, 'K');
+});
+
+test('an older app version that does not share settings leaves them alone on Drive', async () => {
+  const fd = fakeDrive(), drive = S.createDrive(() => 'tok', fd.fetchImpl);
+  await S.runSync(drive, prefsDevice([], Object.assign(blank(), { gkey: { v: 'K', t: 1 } })).store, now);
+  const before = [...fd.files.values()].find(f => f.name === S.PREFS).body;
+  const old = device([{ id: 'b', title: 'Book', added: 1, chapters: [{ title: 'c', paras: ['p'] }] }]);
+  await S.runSync(drive, old.store, now);
+  assert.strictEqual([...fd.files.values()].find(f => f.name === S.PREFS).body, before);
+});
