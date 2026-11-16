@@ -512,8 +512,8 @@
   }
 
   /* ---------- sync through the reader's own Google Drive ---------- */
-  // Paste the OAuth client ID between the quotes to build it in for every device; the Settings box overrides it.
-  const DRIVE_CLIENT_ID = '';
+  // The OAuth client ID built in for every device (a public identifier, not a secret); a value saved in Settings overrides it.
+  const DRIVE_CLIENT_ID = '213870681854-3r1oun4hg6q5okid6eod44j3mjjhnc9l.apps.googleusercontent.com';
   const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
   const GIS = 'https://accounts.google.com/gsi/client';
   const SyncLib = window.LecternSync;
