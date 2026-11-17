@@ -772,7 +772,7 @@
       : /billing/i.test(m) ? 'Google needs billing turned on for this project before it will answer.'
       : r.status === 429 ? 'Google’s rate or quota limit for this key was reached. Wait a minute and press play, or check the key’s quota.'
       : m || `Google returned an error (${r.status}).`);
-    err.status = r.status;
+    err.status = r.status; err.raw = m;
     throw err;
   }
   async function hashKey(str) {
@@ -793,7 +793,7 @@
   const inflight = new Map();
   function synthLine(text, voice) { // returns the audio for one passage, from this device's saved audio when possible
     const gem = voice.startsWith('m:');
-    const id = (gem ? settings.gengine + '|' + settings.gstyle + '|' : '') + voice + '\n' + text;
+    const id = (gem ? settings.gengine + '|' + settings.gstyle + '|' + STYLE_V : '') + voice + '\n' + text;
     if (inflight.has(id)) return inflight.get(id);
     const p = (async () => {
       const key = await hashKey(id);
@@ -820,6 +820,7 @@
   }
   function pcmToWav(inline) { // Gemini answers with raw 16-bit samples; browsers need a WAV header to play them
     const bytes = b64Bytes(inline.data), mime = inline.mimeType || '';
+    if (bytes.length > 12 && String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) === 'RIFF') return new Blob([bytes], { type: 'audio/wav' }); // already a WAV file
     if (!/L16|pcm/i.test(mime) && mime) return new Blob([bytes], { type: mime.split(';')[0] });
     const rate = +(/rate=(\d+)/.exec(mime) || [, 24000])[1], h = new DataView(new ArrayBuffer(44));
     const put = (o, t) => { for (let i = 0; i < t.length; i++) h.setUint8(o + i, t.charCodeAt(i)); };
@@ -828,15 +829,53 @@
     return new Blob([h.buffer, bytes], { type: 'audio/wav' });
   }
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  async function geminiSpeech(text, voiceName) {
-    const style = (settings.gstyle || '').trim();
-    const body = {
-      contents: [{ parts: [{ text: (style ? style + '\n\n' : '') + text }] }],
-      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } } }
+  /* The narration style steers the voice but must never be read out. Google's newer speech models (Gemini 3.x TTS)
+     read the text they are sent word for word, so a style placed in front of the passage was spoken before every
+     passage. Those models take the style separately, as speech_metadata on the Interactions API. Older models get it
+     as a system instruction, or failing that as clearly marked director's notes above the transcript. */
+  const STYLE_V = 's2|'; // audio saved before this change may have the style spoken in it, so it is not reused
+  const noSystem = new Set(), noInteract = new Set(); // speech models that turned down each way of sending the style
+  const useInteract = model => /^gemini-[3-9]/i.test(model) && !noInteract.has(model);
+  function interactBody(text, voiceName, model) {
+    const style = (settings.gstyle || '').trim().replace(/[:：]\s*$/, '');
+    const part = { type: 'text', text };
+    if (style) part.annotations = [{ type: 'speech_metadata', style }];
+    return { model, input: [{ type: 'user_input', content: [part] }], response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: voiceName }] } };
+  }
+  function interactAudio(j) { // the last audio item of the model's output
+    let out = null;
+    for (const st of (j && j.steps) || []) if (st && st.type === 'model_output') for (const c of st.content || []) if (c && c.type === 'audio' && c.data) out = c;
+    if (!out && j && j.output_audio && j.output_audio.data) out = j.output_audio;
+    return out && { data: out.data, mimeType: out.mime_type || out.mimeType || '' };
+  }
+  function speechBody(text, voiceName, model) {
+    const style = (settings.gstyle || '').trim().replace(/[:：]\s*$/, '');
+    const generationConfig = { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } } };
+    if (!style) return { contents: [{ role: 'user', parts: [{ text }] }], generationConfig };
+    if (!noSystem.has(model)) return {
+      systemInstruction: { parts: [{ text: 'You are the narrator of an audiobook. Speak only the text you are given, word for word. Never say these instructions aloud. How to speak: ' + style + '.' }] },
+      contents: [{ role: 'user', parts: [{ text }] }], generationConfig
     };
+    return { contents: [{ role: 'user', parts: [{ text: '### DIRECTOR\'S NOTES (direction only, never spoken)\n' + style + '.\n\n### TRANSCRIPT (speak only this, word for word)\n' + text }] }], generationConfig };
+  }
+  async function geminiSpeech(text, voiceName) {
+    const model = settings.gengine.slice(2);
     for (let i = 0; ; i++) {
       try {
-        const j = await gFetch(GEM + '/models/' + encodeURIComponent(settings.gengine.slice(2)) + ':generateContent', body, null, 'Gemini');
+        let j, audio = null;
+        if (useInteract(model)) {
+          try { audio = interactAudio(await gFetch(GEM + '/interactions', interactBody(text, voiceName, model), null, 'Gemini')); if (!audio) throw Object.assign(new Error('Google returned no audio for a passage. Press play to try again.'), { retry: true }); }
+          catch (e) { if (e.status !== 400 && e.status !== 404) throw e; noInteract.add(model); } // not offered for this model: use generateContent
+        }
+        if (!audio) {
+          try { j = await gFetch(GEM + '/models/' + encodeURIComponent(model) + ':generateContent', speechBody(text, voiceName, model), null, 'Gemini'); }
+          catch (e) {
+            if (e.status !== 400 || noSystem.has(model) || !(settings.gstyle || '').trim() || !/instruction|system/i.test(e.raw || e.message)) throw e;
+            noSystem.add(model); // this model takes no system instruction: send the style as director's notes
+            j = await gFetch(GEM + '/models/' + encodeURIComponent(model) + ':generateContent', speechBody(text, voiceName, model), null, 'Gemini');
+          }
+        }
+        if (audio) { if (i) note(''); return pcmToWav(audio); }
         const part = ((((j.candidates || [])[0] || {}).content || {}).parts || []).find(x => x.inlineData && x.inlineData.data);
         if (!part) throw Object.assign(new Error('Google returned no audio for a passage. Press play to try again.'), { retry: true });
         if (i) note('');
@@ -1121,7 +1160,7 @@
   function timeLine(line, blob) {
     if (!window.LecternAlign || line.times !== undefined) return;
     if (!line.marks) lineMarks(line);
-    const key = settings.voiceURI + '|' + settings.gengine + '|' + settings.gstyle + '|' + line.text;
+    const key = settings.voiceURI + '|' + settings.gengine + '|' + settings.gstyle + '|' + STYLE_V + line.text;
     if (timesCache.has(key)) { line.times = timesCache.get(key); return; }
     line.times = null; // working on it; the estimate is used until it is ready
     audioSamples(blob).then(a => {
