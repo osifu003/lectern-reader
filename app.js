@@ -73,6 +73,7 @@
   let tts = null, claudeVoices = [], pgen = 0, pseq = 0, pcur = null, plines = new Map(), pline = null, plastMs = 0, pk = 1, pStarted = 0, pmark = 0;
   let gModels = [], gOcrModel = '', ocrJob = null, ocrCtl = null, pPaused = null, gAll = [], wired = false;
   let gdrive = ls.get('lectern.drive', null), syncChain = Promise.resolve(), syncTimer = null, posDirty = false, firstSync = true, booksReady = null, syncing = false;
+  let prepNote = false, prepT = 0; // the "Preparing audio" cue
   let playing = false, tok = 0, timers = [], words = [], wordOn = null, activeEl = null, keep = null;
 
   const reader = $('reader'), stage = $('stage');
@@ -770,9 +771,10 @@
       : /has not been used|is disabled|not enabled/i.test(m) ? `The ${api} API is not turned on for this key’s Google Cloud project. Enable it in the Google Cloud console, wait a minute, then try again.`
       : /referer|referrer|blocked/i.test(m) ? `This key is restricted and does not allow this site or the ${api} API. Adjust the key’s restrictions in the Google Cloud console.`
       : /billing/i.test(m) ? 'Google needs billing turned on for this project before it will answer.'
+      : r.status === 429 && /per.?day/i.test(m) ? 'Google’s daily limit for this key is used up. It resets at midnight Pacific time, or raise the key’s quota in Google Cloud.'
       : r.status === 429 ? 'Google’s rate or quota limit for this key was reached. Wait a minute and press play, or check the key’s quota.'
       : m || `Google returned an error (${r.status}).`);
-    err.status = r.status; err.raw = m;
+    err.status = r.status; err.raw = m; err.daily = r.status === 429 && /per.?day/i.test(m);
     throw err;
   }
   async function hashKey(str) {
@@ -791,9 +793,17 @@
     $('gUsage').textContent = `Sent to Google from this device this month: ${v.chars.toLocaleString()} characters. Passages you replay are not sent again.`;
   }
   const inflight = new Map();
+  const audioId = (text, voice) => (voice.startsWith('m:') ? settings.gengine + '|' + settings.gstyle + '|' + STYLE_V : '') + voice + '\n' + text;
+  async function hasAudio(text, voice) { // already saved on this device, so it plays at once
+    const id = audioId(text, voice);
+    if (inflight.has(id)) return false;
+    const key = await hashKey(id);
+    const hit = await idb('readonly', st => st.get(key), 'audio');
+    return !!(hit && hit.blob);
+  }
   function synthLine(text, voice) { // returns the audio for one passage, from this device's saved audio when possible
     const gem = voice.startsWith('m:');
-    const id = (gem ? settings.gengine + '|' + settings.gstyle + '|' + STYLE_V : '') + voice + '\n' + text;
+    const id = audioId(text, voice);
     if (inflight.has(id)) return inflight.get(id);
     const p = (async () => {
       const key = await hashKey(id);
@@ -881,15 +891,16 @@
         if (i) note('');
         return pcmToWav(part.inlineData);
       } catch (e) {
-        if (i >= 3 || !(e.retry || e.status === 429 || e.status >= 500)) throw e;
-        if (e.status === 429 && playing) note('Google’s rate limit for this key was reached. Waiting a moment, then carrying on…');
+        if (i >= 3 || e.daily || !(e.retry || e.status === 429 || e.status >= 500)) throw e;
+        if (playing) note(e.status === 429 ? 'Google’s rate limit for this key was reached. Waiting a moment, then carrying on…'
+          : 'Google did not send the audio yet. Trying again…');
         await sleep([4000, 15000, 35000][i]);
       }
     }
   }
   const audioEl = new Audio(); audioEl.preload = 'auto';
   const gtts = (() => { // a small player: a queue of passages, fetched ahead and played back to back on one audio element
-    const H = { line: [], pos: [], state: [], audio: [] };
+    const H = { line: [], pos: [], state: [], audio: [], wait: [] };
     let q = [], cur = null, run = 0, rate = 1, voice = '', paused = false, busy = false;
     const emit = (k, e) => H[k].forEach(f => { try { f(e); } catch (err) { console.error(err); } });
     const drop = why => { for (const it of q) it.rej(why); if (cur) cur.rej(why); q = []; cur = null; };
@@ -897,8 +908,8 @@
       if (opts && opts.voice) voice = opts.voice;
       if (opts && opts.rate) rate = opts.rate;
       return Promise.all(lines.map(l => new Promise((res, rej) => {
-        const it = { id: l.id, res, rej, blob: synthLine(l.text, voice) };
-        it.blob.then(blob => emit('audio', { id: l.id, blob }), () => {}); // lets the word timing be worked out before the passage plays
+        const it = { id: l.id, res, rej, blob: synthLine(l.text, voice), ready: false };
+        it.blob.then(blob => { it.ready = true; emit('audio', { id: l.id, blob }); }, () => { it.ready = true; }); // lets the word timing be worked out before the passage plays
         q.push(it);
       })));
     }
@@ -908,6 +919,7 @@
         const it = q.shift();
         if (!it) { cur = null; busy = false; emit('state', { state: 'idle', reason: 'completed' }); return; }
         cur = it;
+        if (!it.ready) emit('wait', { id: it.id }); // the audio is still being made: say so rather than sit silent
         let blob;
         try { blob = await it.blob; } catch (e) { if (my === run) { run++; busy = false; drop(e); } return; }
         if (my !== run) return;
@@ -941,7 +953,7 @@
       unlock() { if (!busy) { audioEl.src = SILENCE; audioEl.play().catch(() => {}); } },
       setRate(r) { rate = r; audioEl.playbackRate = r; },
       active: () => busy, isPaused: () => busy && paused,
-      onLine: f => H.line.push(f), onPosition: f => H.pos.push(f), onState: f => H.state.push(f), onAudio: f => H.audio.push(f)
+      onLine: f => H.line.push(f), onPosition: f => H.pos.push(f), onState: f => H.state.push(f), onAudio: f => H.audio.push(f), onWait: f => H.wait.push(f)
     };
   })();
   const GEM_VOICES = [['Sulafat', 'warm'], ['Achird', 'friendly'], ['Vindemiatrix', 'gentle'], ['Achernar', 'soft'], ['Algieba', 'smooth'], ['Despina', 'smooth'], ['Charon', 'informative'], ['Rasalgethi', 'informative'],
@@ -1180,20 +1192,51 @@
   const pOpts = () => ({ voice: settings.voiceURI, rate: pRate() });
   const pErr = gen => e => { if (gen !== pgen || !playing || (e && e.code === 'stopped')) return; haltPremium(e && e.code, e && e.message); };
   function haltPremium(code, msg) {
-    playing = false; tok++; pgen++; clearTimers(); setWord(-1); setPlayIcon();
+    playing = false; tok++; pgen++; clearTimers(); preparing(false); setWord(-1); setPlayIcon();
     const quiet = ['viewer_stopped', 'interrupted', 'hidden', 'stopped', 'replaced'];
     if (quiet.includes(code)) return;
     note(msg || 'The voice was interrupted. Press play to continue.');
+    $('voiceNote').classList.add('err');
+  }
+  /* A Gemini passage is made whole before any of it plays, and the long ones take a while. So unless the passage is
+     already saved, a reading starts with a short passage of a sentence or two from the chosen sentence, then the rest
+     of that passage, and then carries on with the usual passages, which keep their saved audio. */
+  const LEAD_MIN = 90, LEAD_MAX = 260;
+  function lineText(c, from, to) { // joined the same way as chunksFor
+    const m = model(c); let text = '';
+    for (let i = from; i <= to; i++) { if (i > from && m[i].p !== m[i - 1].p && !/\s$/.test(text)) text += '\n\n'; text += m[i].text; }
+    return text.trim().slice(0, 1800);
+  }
+  function addLine(c, from, to, text) {
+    const line = { id: pgen + ':' + (pseq++), c, from, to, text };
+    plines.set(line.id, line);
+    return line;
+  }
+  async function leadLines(voice) {
+    const ch = chunksFor(pcur.c), x = ch.find(k => k.to >= pcur.s);
+    if (!x || !voice.startsWith('m:') || x.text.length <= LEAD_MAX) return [];
+    if (await hasAudio(x.text, voice)) return [];
+    const m = model(pcur.c), s = Math.max(pcur.s, x.from);
+    let to = s, len = m[s].text.length;
+    while (to < x.to && len < LEAD_MIN && len + m[to + 1].text.length <= LEAD_MAX) len += m[++to].text.length;
+    const out = [addLine(pcur.c, s, to, lineText(pcur.c, s, to))];
+    if (to < x.to) out.push(addLine(pcur.c, to + 1, x.to, lineText(pcur.c, to + 1, x.to)));
+    pcur = { c: pcur.c, s: x.to + 1 };
+    return out;
   }
   function startPremium() {
     const token = ++tok, gen = ++pgen; clearTimers(); pline = null;
     try { synth && synth.cancel(); } catch {}
-    const go = () => {
+    const go = async () => {
       if (token !== tok || gen !== pgen) return;
       pStarted = Date.now(); pseq = 0; plines = new Map(); pline = null; plastMs = 0; pcur = { c: ci, s: si };
-      const first = [nextLine(), nextLine(), nextLine()].filter(Boolean);
+      pPaused = null; note(''); tts.unlock(); // while the press still counts, so the audio is allowed to play when it arrives
+      preparing(true);
+      const voice = settings.voiceURI;
+      const first = await leadLines(voice);
+      if (token !== tok || gen !== pgen) return;
+      while (first.length < 3) { const n = nextLine(); if (!n) break; first.push(n); }
       if (!first.length) { stop(); return; }
-      note(''); pPaused = null; tts.unlock();
       tts.speak(first.map(lineArg), pOpts()).catch(pErr(gen));
     };
     // skipping quickly through sentences should not start a reading per press
@@ -1201,9 +1244,11 @@
   }
   function wireTts() {
     tts.onAudio(({ id, blob }) => { const line = plines.get(id); if (line) timeLine(line, blob); });
+    tts.onWait(({ id }) => { if (playing && String(id).startsWith(pgen + ':')) preparing(true); });
     tts.onLine(({ id }) => {
       const line = plines.get(id);
       if (!line || !playing || !String(id).startsWith(pgen + ':')) return;
+      preparing(false);
       calibrate(); pline = line; plastMs = 0; pmark = 0; if (!line.marks) lineMarks(line);
       if (line.c !== ci) { ci = line.c; renderChapter(line.from); } else activate(line.from);
       setWord(0);
@@ -1321,11 +1366,11 @@
   function toggle() {
     if (!playing) return play();
     if (premium() && tts.active() && pline) { // hold the audio exactly where it is
-      tts.pause(); playing = false; pPaused = { c: ci, s: si }; setWord(-1); setPlayIcon();
+      tts.pause(); playing = false; pPaused = { c: ci, s: si }; preparing(false); setWord(-1); setPlayIcon();
     } else stop();
   }
   function stop() {
-    playing = false; tok++; clearTimers();
+    playing = false; tok++; clearTimers(); preparing(false);
     try { synth && synth.cancel(); } catch {}
     quietTts();
     if (posDirty) schedulePos(1500);
@@ -1402,7 +1447,17 @@
   function status(msg, err) { const el = $('status'); el.textContent = msg; el.classList.toggle('err', !!err); }
   let toastT;
   function toast(msg) { const el = $('toast'); el.textContent = msg; el.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => el.hidden = true, 3200); }
-  function note(msg) { const el = $('voiceNote'); el.textContent = msg; el.hidden = !msg; }
+  function note(msg) { const el = $('voiceNote'); el.textContent = msg; el.hidden = !msg; el.classList.remove('busy', 'err'); prepNote = false; }
+  function preparing(on) { // from the press of play until the voice is heard, show that audio is on its way
+    const b = $('playBtn');
+    b.classList.toggle('loading', on); b.setAttribute('aria-busy', on ? 'true' : 'false');
+    clearTimeout(prepT);
+    if (on) {
+      const el = $('voiceNote'); const err = !el.hidden && !prepNote;
+      if (!err) { note('Preparing audio…'); el.classList.add('busy'); prepNote = true; }
+      prepT = setTimeout(() => { if (prepNote) { note('Still preparing audio. Google can take a few seconds for a new passage.'); $('voiceNote').classList.add('busy'); prepNote = true; } }, 8000);
+    } else if (prepNote) note('');
+  }
 
   /* ---------- events ---------- */
   $('playBtn').onclick = () => toggle();
