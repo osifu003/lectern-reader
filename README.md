@@ -36,7 +36,7 @@ billed to the key's project.
 Books, chapters and reading positions can follow you to every device through your own Google Drive. They are
 kept in Drive's hidden app data folder (scope `drive.appdata`), which only this app can open; nothing goes to
 any other server. Your Google API key and voice settings (voice engine, voice, language, narration style and
-speed) travel the same way, so a new device has them as soon as you sign in. Saved audio and display settings
+speed, Skip text) travel the same way, so a new device has them as soon as you sign in. Saved audio and display settings
 (font, size, theme, highlight options) stay on each device.
 
 One-time setup, on a computer:
@@ -70,12 +70,34 @@ passage's punctuation and paragraph breaks, and spreads the words between pauses
 takes to say. It follows the audio's own clock, so pausing and speed changes stay in step. It is still an estimate
 within each stretch between pauses, usually within a word of the voice.
 
-Tests: `node --test tests/sync.test.js tests/align.test.js`
+## Skip text
+
+Settings › Skip text has six switches for text that is shown on the page but not read aloud: round, square and curly
+brackets, web addresses, superscripts and subscripts, and vertical text. Skipped text stays visible, dimmed, and the word
+highlight moves only over what is spoken. The choices travel with the voice settings through Drive sync.
+
+How each is found (`skip.js`):
+
+- Brackets: matched pairs, nested or not. A closing bracket with no opener (a list's "a)") is ignored, and a bracket
+  that never closes is ignored, so a stray "(" never silences the rest of a paragraph.
+- Web addresses: anything starting with http://, https://, ftp:// or www., a DOI, or a domain followed by a path
+  (example.org/page). A bare name such as Amazon.com is read, since in prose it is usually a word.
+- Superscripts and subscripts: in PDFs, from each piece of text's size and baseline compared with the full-size text
+  beside it; in EPUB and HTML, from sup and sub tags and note links; in Word files, from raised and lowered runs; in
+  scanned pages read by Gemini, from tags the model is asked to add; and ¹²³ typed as characters anywhere. Note and
+  citation numbers are skipped; exponents and formulas (x², m³, H₂O) and ordinals (21st) are still read.
+- Vertical text: PDFs only, text turned across the page's main direction (margin stamps, rotated side labels).
+
+Superscripts and vertical text are recorded when a book is added, so books added before this feature need adding again
+for those two; brackets and addresses work on every book.
+
+Tests: `node --test tests/sync.test.js tests/align.test.js tests/skip.test.js`
 
 ## How it works
 
 - `index.html`, `app.css`, `app.js`: the whole app.
 - `sync.js`: Google Drive sync (merge rules and a small Drive client); `tests/` covers it.
+- `skip.js`: Skip text (what is left out of narration, and sentence splitting); `tests/skip.test.js` covers it.
 - `sw.js`, `manifest.webmanifest`, `icons/`: offline support and installation.
 - `vendor/`: pdf.js 3.11.174 and JSZip 3.10.1, used to open PDF, EPUB and Word files.
 

@@ -5,8 +5,8 @@
 
   const STATE = 'state.json';
   const PREFS = 'prefs.json';
-  // Voice settings that follow the reader to every device; display settings stay per device.
-  const PREF_KEYS = ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate'];
+  // Voice and reading settings that follow the reader to every device (skip: the Skip text choices); display settings stay per device.
+  const PREF_KEYS = ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate', 'skip'];
   const TOMB_DAYS = 180;
   const bookName = id => 'book-' + id + '.json';
   const bookVersion = b => b.updated || b.added || 0;

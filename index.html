@@ -176,12 +176,23 @@
       <label class="check"><input type="checkbox" id="scrollC"><span>Keep my place on screen<small>Scrolls so the current sentence stays in view.</small></span></label>
       <label class="check"><input type="checkbox" id="voiceC"><span>Read aloud with a voice<small>Turn off to use the moving highlight as a silent pacer at the chosen speed.</small></span></label>
     </div>
+    <div class="field" id="skipField">
+      <h4>Skip text</h4>
+      <p class="status">Skipped text stays on the page, dimmed, but is not read aloud.</p>
+      <label class="check"><input type="checkbox" data-skip="round"><span><b class="glyph" aria-hidden="true">( )</b>Round brackets<small>Skip text in round brackets.</small></span></label>
+      <label class="check"><input type="checkbox" data-skip="square"><span><b class="glyph" aria-hidden="true">[ ]</b>Square brackets<small>Skip text in square brackets, such as [12] citations.</small></span></label>
+      <label class="check"><input type="checkbox" data-skip="curly"><span><b class="glyph" aria-hidden="true">{ }</b>Curly brackets<small>Skip text in curly brackets.</small></span></label>
+      <label class="check"><input type="checkbox" data-skip="url"><span><b class="glyph" aria-hidden="true">www</b>URLs<small>Skip web addresses.</small></span></label>
+      <label class="check"><input type="checkbox" data-skip="sup"><span><b class="glyph" aria-hidden="true">x¹</b>Superscript and subscript<small>Skip note and citation numbers. Exponents and formulas such as x² and H₂O are still read. Works on books added from now on, and on ¹²³ typed as characters.</small></span></label>
+      <label class="check"><input type="checkbox" data-skip="vert"><span><b class="glyph" aria-hidden="true">↕</b>Vertical<small>Skip text running up or down the page, such as labels in a PDF’s margin. Works on PDFs added from now on.</small></span></label>
+    </div>
   </div>
 </dialog>
 
 <div class="toast" id="toast" role="status" hidden></div>
 <script src="sync.js" defer></script>
 <script src="align.js" defer></script>
+<script src="skip.js" defer></script>
 <script src="app.js" defer></script>
 <div class="drag-veil" id="dragVeil" aria-hidden="true"><div class="drag-veil-in"><strong>Drop to add to your library</strong><small>PDF, EPUB, Word, text or page photos</small></div></div>
 </body>
