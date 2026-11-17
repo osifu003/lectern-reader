@@ -3,6 +3,7 @@
   const $ = id => document.getElementById(id);
   const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
   const WPM = 175;
+  const S = window.LecternSkip; // skip.js: what is left out of narration
 
   /* ---------- sample (public domain: Lewis Carroll, 1865) ---------- */
   const SAMPLE = {
@@ -62,7 +63,7 @@
   let persistOk = true;
 
   /* ---------- state ---------- */
-  const DEFAULTS = { font: 'book', size: 20, lh: 1.7, width: 66, word: true, focus: false, scroll: true, voice: true, rate: 1, voiceURI: '', gkey: '', glang: '', gengine: '', gstyle: 'Read this aloud as a warm, natural audiobook narrator:', theme: 'auto' };
+  const DEFAULTS = { font: 'book', size: 20, lh: 1.7, width: 66, word: true, focus: false, scroll: true, voice: true, rate: 1, voiceURI: '', gkey: '', glang: '', gengine: '', gstyle: 'Read this aloud as a warm, natural audiobook narrator:', theme: 'auto', skip: 'square,curly,url,sup,vert' };
   const settings = Object.assign({}, DEFAULTS, ls.get('lectern.settings', {}));
   let positions = ls.get('lectern.pos', {});
   let books = [SAMPLE];
@@ -79,18 +80,6 @@
 
   /* ---------- text helpers ---------- */
   const segmenter = (window.Intl && Intl.Segmenter) ? new Intl.Segmenter(undefined, { granularity: 'sentence' }) : null;
-  function splitSentences(t) {
-    let parts;
-    if (segmenter) parts = Array.from(segmenter.segment(t), s => s.segment);
-    else parts = t.match(/[^.!?]+[.!?]+["'”’)\]]*\s*|[^.!?]+$/g) || [t];
-    const out = [];
-    for (const p of parts) {
-      if (!p.trim()) continue;
-      // glue fragments with no letters or digits (stray quotes, dashes) to the previous sentence
-      if (out.length && !/[\p{L}\p{N}]/u.test(p)) out[out.length - 1] += p; else out.push(p);
-    }
-    return out;
-  }
   const clean = s => s.replace(/\s+/g, ' ').trim();
   const HEAD = /^(chapter|part|book|section|prologue|epilogue|introduction|preface)\b.{0,70}$/i;
 
@@ -98,8 +87,9 @@
     const chapters = []; let cur = null;
     for (const b of blocks) {
       if (!b.t) continue;
-      const isHead = b.h || (b.t.length < 80 && HEAD.test(b.t) && !/[.,;]$/.test(b.t));
-      if (isHead) { cur = { title: b.t, paras: [] }; chapters.push(cur); continue; }
+      const plain = S.scrub(b.t);
+      const isHead = b.h || (plain.length < 80 && HEAD.test(plain) && !/[.,;]$/.test(plain));
+      if (isHead) { cur = { title: plain, paras: [] }; chapters.push(cur); continue; }
       if (!cur) { cur = { title: fallbackTitle || 'Beginning', paras: [] }; chapters.push(cur); }
       cur.paras.push(b.t);
     }
@@ -115,10 +105,26 @@
     const chunks = /\n\s*\n/.test(text) ? text.split(/\n\s*\n+/) : text.split('\n');
     return chunks.map(c => ({ t: clean(c.replace(/^#{1,6}\s+/, '')), h: /^#{1,3}\s+\S/.test(c.trim()) }));
   }
+  function markInline(root) { // superscripts, subscripts and note references keep a mark in the text, for Skip text
+    const kindOf = el => {
+      const n = el.localName, st = (el.getAttribute('style') || '').toLowerCase(), ty = (el.getAttribute('epub:type') || '') + ' ' + (el.getAttribute('role') || '');
+      if (n === 'sup' || /vertical-align\s*:\s*super/.test(st) || /\bnoteref\b/.test(ty)) return 'sup';
+      if (n === 'sub' || /vertical-align\s*:\s*sub\b/.test(st)) return 'sub';
+      return null;
+    };
+    const els = Array.from(root.querySelectorAll('sup,sub,a,span,[style]')).filter(el => kindOf(el));
+    for (const el of els) {
+      if (!el.isConnected) continue;
+      let up = el.parentElement, inside = false;
+      while (up && up !== root) { if (kindOf(up)) { inside = true; break; } up = up.parentElement; }
+      if (!inside && !el.querySelector('p,div,li,blockquote,td,h1,h2,h3,h4,h5,h6')) el.textContent = S.wrap(el.textContent, kindOf(el));
+    }
+  }
   function domBlocks(root) {
     const sel = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,pre,div,td,dd,dt';
     const out = [];
     root.querySelectorAll('script,style,nav,noscript').forEach(n => n.remove());
+    markInline(root);
     const els = root.querySelectorAll(sel);
     if (!els.length) { const t = clean(root.textContent || ''); return t ? [{ t }] : []; }
     els.forEach(el => {
@@ -176,7 +182,7 @@
       const blocks = domBlocks(body);
       if (!blocks.length) continue;
       let title = '';
-      if (blocks[0].h) title = blocks.shift().t;
+      if (blocks[0].h) title = S.scrub(blocks.shift().t);
       const paras = blocks.map(b => b.t);
       if (!paras.length) continue;
       if (paras.join(' ').length < 200 && !title && chapters.length) { chapters[chapters.length - 1].paras.push(...paras); continue; }
@@ -190,9 +196,14 @@
     const f = zip.file('word/document.xml');
     if (!f) throw new Error('This does not look like a valid Word document.');
     const doc = parseXml(await f.async('string'), 'application/xml');
+    const kid = (el, name) => Array.from(el.childNodes).filter(n => n.nodeName === name);
     const blocks = Array.from(doc.getElementsByTagName('w:p')).map(p => {
       const style = p.getElementsByTagName('w:pStyle')[0];
-      const t = clean(Array.from(p.getElementsByTagName('w:t')).map(n => n.textContent).join(''));
+      const t = clean(Array.from(p.getElementsByTagName('w:r')).map(r => { // raised and lowered runs keep a mark, for Skip text
+        const txt = kid(r, 'w:t').map(n => n.textContent).join('');
+        const pr = kid(r, 'w:rPr')[0], va = pr && kid(pr, 'w:vertAlign')[0], v = va && va.getAttribute('w:val');
+        return v === 'superscript' ? S.wrap(txt, 'sup') : v === 'subscript' ? S.wrap(txt, 'sub') : S.scrub(txt);
+      }).join(''));
       return { t, h: !!style && /^(heading\s?[12]|title)$/i.test(style.getAttribute('w:val') || '') };
     });
     return { title: name, chapters: chaptersFromBlocks(blocks, name) };
@@ -210,25 +221,27 @@
         status(`Reading page ${n} of ${pdf.numPages}…`);
         const page = await pdf.getPage(n);
         const tc = await page.getTextContent();
+        const kinds = S.pdfKinds(tc.items, tc.styles); // superscripts, subscripts and vertical text keep a mark, for Skip text
         let line = '';
-        for (const it of tc.items) {
-          if (typeof it.str !== 'string') continue;
-          line += it.str;
+        tc.items.forEach((it, x) => {
+          if (typeof it.str !== 'string') return;
+          line += kinds[x] ? S.wrap(it.str, kinds[x]) : S.scrub(it.str);
           if (it.hasEOL) { lines.push(line); line = ''; }
-        }
+        });
         lines.push(line, '');
         page.cleanup();
       }
-      const lens = lines.map(l => l.trim().length).filter(Boolean).sort((a, b) => a - b);
+      const lens = lines.map(l => S.bare(l).trim().length).filter(Boolean).sort((a, b) => a - b);
       const full = lens.length ? lens[Math.floor(lens.length * 0.9)] : 0;
       const paras = []; let cur = '';
       const flush = () => { const t = clean(cur); if (t) paras.push(t); cur = ''; };
       for (const raw of lines) {
         const l = raw.trim();
-        if (!l) { if (/[.!?]["”’)]?$/.test(cur)) flush(); continue; }
+        const lb = S.bare(l).trim(); // the line without its superscripts and margin text, for judging where it ends
+        if (!l) { if (/[.!?]["”’)]?$/.test(S.bare(cur).trim())) flush(); continue; }
         if (/^\d{1,4}$/.test(l)) continue; // bare page numbers
         cur = /[A-Za-z]-$/.test(cur) ? cur.slice(0, -1) + l : (cur ? cur + ' ' + l : l);
-        if (/[.!?]["”’)]?$/.test(l) && l.length < full * 0.8) flush();
+        if (/[.!?]["”’)]?$/.test(lb) && lb.length < full * 0.8) flush();
       }
       flush();
       if (paras.length) chapters.push({ title: start === end ? `Page ${start}` : `Pages ${start}–${end}`, paras });
@@ -366,7 +379,8 @@
     let m = models.get(c);
     if (!m) {
       m = [];
-      book.chapters[c].paras.forEach((para, p) => { for (const t of splitSentences(para)) m.push({ text: t, p }); });
+      const o = S.options(settings.skip);
+      book.chapters[c].paras.forEach((para, p) => { for (const x of S.passage(para, o, segmenter)) { x.p = p; m.push(x); } });
       models.set(c, m);
     }
     return m;
@@ -394,8 +408,9 @@
     let p = null, lastP = -1;
     for (const s of model(ci)) {
       if (s.p !== lastP) { p = document.createElement('p'); frag.appendChild(p); lastP = s.p; }
-      const sp = document.createElement('span'); sp.className = 's'; sp.textContent = s.text; sp.dataset.i = sents.length;
-      sents.push({ el: sp, text: s.text, n: (s.text.match(/\S+/g) || []).length });
+      const sp = document.createElement('span'); sp.className = 's'; sp.dataset.i = sents.length;
+      const x = { el: sp, text: s.text, say: s.say, ws: s.words, skip: s.skip, marks: s.marks, n: s.words.length };
+      sents.push(x); paint(sp, x, null);
       p.appendChild(sp);
     }
     reader.appendChild(frag);
@@ -409,10 +424,36 @@
     stage.scrollTop = 0;
     activate(si, si > 0);
   }
+  // Draws a sentence: skipped text stays on the page, dimmed; superscripts and subscripts are raised and lowered.
+  // With out, each spoken word gets its own span for the highlight; at is its place in what is spoken.
+  function paint(el, s, out) {
+    if (!out && !s.skip.length && !s.marks.length) { el.textContent = s.text; return; }
+    el.textContent = '';
+    const piece = (parent, a, b) => {
+      const pts = [a, b];
+      for (const r of s.skip.concat(s.marks)) for (const x of [r[0], r[1]]) if (x > a && x < b) pts.push(x);
+      pts.sort((x, y) => x - y);
+      for (let k = 0; k + 1 < pts.length; k++) {
+        const x = pts[k], y = pts[k + 1]; if (x >= y) continue;
+        let node = document.createTextNode(s.text.slice(x, y));
+        const mk = s.marks.find(r => r[0] <= x && y <= r[1]);
+        if (mk && mk[2] !== 'vert') { const e = document.createElement(mk[2]); e.appendChild(node); node = e; }
+        if (s.skip.some(r => r[0] <= x && y <= r[1])) { const e = document.createElement('span'); e.className = 'skip'; e.appendChild(node); node = e; }
+        parent.appendChild(node);
+      }
+    };
+    let at = 0;
+    if (out) for (const w of s.ws) {
+      piece(el, at, w.a);
+      const sp = document.createElement('span'); sp.className = 'w'; piece(sp, w.a, w.b); el.appendChild(sp);
+      out.push({ el: sp, at: w.at, len: w.t.length, t: w.t }); at = w.b;
+    }
+    piece(el, at, s.text.length);
+  }
   function deactivate() {
     if (!activeEl) return;
     const s = sents[+activeEl.dataset.i];
-    activeEl.textContent = s.text; activeEl.classList.remove('on');
+    paint(activeEl, s, null); activeEl.classList.remove('on');
     activeEl.parentNode.classList.remove('live');
     activeEl = null; words = []; wordOn = null;
   }
@@ -421,16 +462,7 @@
     const s = sents[i]; if (!s) return;
     si = i; activeEl = s.el;
     s.el.classList.add('on'); s.el.parentNode.classList.add('live');
-    if (settings.word) {
-      s.el.textContent = ''; let last = 0, m; const re = /\S+/g;
-      while ((m = re.exec(s.text))) {
-        if (m.index > last) s.el.appendChild(document.createTextNode(s.text.slice(last, m.index)));
-        const w = document.createElement('span'); w.className = 'w'; w.textContent = m[0];
-        s.el.appendChild(w); words.push({ el: w, at: m.index, len: m[0].length, t: m[0] });
-        last = m.index + m[0].length;
-      }
-      if (last < s.text.length) s.el.appendChild(document.createTextNode(s.text.slice(last)));
-    }
+    if (settings.word) paint(s.el, s, words);
     if (scroll !== false && settings.scroll) {
       const r = s.el.getBoundingClientRect(), v = stage.getBoundingClientRect();
       if (r.top < v.top + v.height * 0.15 || r.bottom > v.top + v.height * 0.7) {
@@ -556,7 +588,7 @@
 
   /* ---------- the Google key and voice settings follow you through the same sync ---------- */
   // Each shared setting remembers when it was last changed by hand; the newest change wins on every device.
-  const PREF_KEYS = (SyncLib && SyncLib.PREF_KEYS) || ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate'];
+  const PREF_KEYS = (SyncLib && SyncLib.PREF_KEYS) || ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate', 'skip'];
   const VOICE_KEYS = ['gkey', 'gengine', 'glang', 'voiceURI'];
   const prefValue = k => k === 'voiceURI' && !/^[gm]:/.test(settings.voiceURI) ? '' : settings[k]; // this device's own built-in voices stay here
   let prefT = ls.get('lectern.prefT', null);
@@ -588,11 +620,12 @@
     saveSettings();
     $('gKey').value = settings.gkey; $('gStyle').value = settings.gstyle;
     if (changed.includes('rate')) { applySettings(); updateProgress(); if (premium()) syncRate(); }
+    if (changed.includes('skip')) { applySettings(); reskip(); }
     if (changed.some(k => VOICE_KEYS.includes(k))) {
       chunkCache = new Map();
       initGoogle().then(() => restartIfPlaying());
     } else if (changed.includes('gstyle')) restartIfPlaying();
-    toast(changed.includes('gkey') ? (settings.gkey ? 'Your Google key and voice settings arrived from your other devices.' : 'Your Google key was removed on another device.') : 'Voice settings updated from your other devices.');
+    toast(changed.includes('gkey') ? (settings.gkey ? 'Your Google key and voice settings arrived from your other devices.' : 'Your Google key was removed on another device.') : changed.every(k => k === 'skip') ? 'Skip text settings updated from your other devices.' : 'Voice settings updated from your other devices.');
   }
   function renderKeyBtns() {
     const has = !!settings.gkey;
@@ -1037,14 +1070,14 @@
   async function ocrRead(blobs, nums, signal) {
     if (!gOcrModel) return visionRead(blobs, signal);
     const parts = [{ text: `The ${nums.length === 1 ? 'image is page' : 'images are pages'} ${nums.join(', ')} of a scanned book${nums.length > 1 ? ', in that order' : ''}. Transcribe the main body text exactly as printed, for reading aloud.\n` +
-      'Rules: begin each page with a line of the form === PAGE <number> === using the page numbers given. Leave out running headers, footers and printed page numbers. Rejoin words hyphenated across line breaks. Write each paragraph on one line with a blank line between paragraphs. Put a chapter title or heading on its own line. Describe nothing, add no comments, and if a page has no text write only its marker line.' }];
+      'Rules: begin each page with a line of the form === PAGE <number> === using the page numbers given. Leave out running headers, footers and printed page numbers. Rejoin words hyphenated across line breaks. Write each paragraph on one line with a blank line between paragraphs. Put a chapter title or heading on its own line. Wrap superscript text (note and citation numbers) in <sup></sup>, subscript text in <sub></sub>, and text printed vertically in a margin in <v></v>. Describe nothing, add no comments, and if a page has no text write only its marker line.' }];
     for (const b of blobs) parts.push({ inlineData: { mimeType: b.type || 'image/jpeg', data: await blobB64(b) } });
     const j = await gFetch(GEM + '/models/' + encodeURIComponent(gOcrModel) + ':generateContent', { contents: [{ parts }], generationConfig: { temperature: 0 } }, signal, 'Gemini');
     const text = ((((j.candidates || [])[0] || {}).content || {}).parts || []).map(x => x.text || '').join('');
     if (!text.trim()) throw new Error('Google returned no text for those pages.');
     const segs = text.split(/^\s*===\s*PAGE\s+(\d+)\s*===\s*$/mi), by = new Map();
     if (segs.length < 3) by.set(nums[0], text); else for (let i = 1; i < segs.length; i += 2) by.set(+segs[i], segs[i + 1] || '');
-    return nums.map(n => (by.get(n) || '').split(/\n\s*\n/).map(clean).filter(Boolean));
+    return nums.map(n => (by.get(n) || '').split(/\n\s*\n/).map(x => clean(S.fromTags(x))).filter(Boolean));
   }
   async function visionRead(blobs, signal) {
     const requests = [];
@@ -1056,7 +1089,7 @@
       for (const pg of (r.fullTextAnnotation && r.fullTextAnnotation.pages) || []) for (const bl of pg.blocks || []) for (const pa of bl.paragraphs || []) {
         let t = '';
         for (const w of pa.words || []) for (const sy of w.symbols || []) {
-          t += sy.text || '';
+          t += S.scrub(sy.text || '');
           const br = sy.property && sy.property.detectedBreak && sy.property.detectedBreak.type;
           if (br && br !== 'HYPHEN') t += ' '; // a line-end hyphen means the word continues on the next line
         }
@@ -1090,7 +1123,7 @@
   function wordMs(w) { return 60000 / (WPM * settings.rate) * wUnit(w.t); }
   function pace(token, silent, state) {
     const s = sents[si]; let k = 0;
-    const list = words.length ? words : (s.text.match(/\S+/g) || []).map(x => ({ t: x }));
+    const list = words.length ? words : s.ws;
     const step = () => {
       if (token !== tok) return;
       if (!silent && state.real) return;       // the voice is reporting real word positions
@@ -1109,13 +1142,17 @@
     if (!ch) {
       ch = []; const m = model(c), big = settings.voiceURI.startsWith('m:');
       const min = big ? 450 : 110, max = big ? 900 : 420;
+      let lead = -1; // sentences with nothing to say (all skipped) ride along with a passage next to them
       for (let i = 0; i < m.length; i++) {
-        const from = i; let text = m[i].text;
-        while (text.trim().length < min && i + 1 < m.length && (big || m[i + 1].p === m[from].p) && text.length + m[i + 1].text.length <= max) {
+        const from = i; let text = m[i].say;
+        while (text.trim().length < min && i + 1 < m.length && (big || m[i + 1].p === m[from].p) && text.length + m[i + 1].say.length <= max) {
           if (m[i + 1].p !== m[i].p && !/\s$/.test(text)) text += '\n\n';
-          text += m[++i].text;
+          text += m[++i].say;
         }
-        ch.push({ from, to: i, text: text.trim().slice(0, 1800) });
+        text = text.trim().slice(0, 1800);
+        if (text) { ch.push({ from: lead < 0 ? from : lead, to: i, text }); lead = -1; }
+        else if (ch.length) ch[ch.length - 1].to = i;
+        else if (lead < 0) lead = from;
       }
       chunkCache.set(c, ch);
     }
@@ -1135,7 +1172,7 @@
   function lineMarks(line) {
     const m = model(line.c); line.marks = []; let acc = 0;
     for (let i = line.from; i <= line.to; i++) {
-      const ws = m[i].text.match(/\S+/g) || [], para = i === line.to || m[i + 1].p !== m[i].p;
+      const ws = m[i].words.map(w => w.t), para = i === line.to || m[i + 1].p !== m[i].p;
       ws.forEach((t, k) => {
         const brk = window.LecternAlign ? LecternAlign.breakAfter(t, k === ws.length - 1, para && k === ws.length - 1) : 0;
         line.marks.push({ s: i, k, at: acc, t, brk });
@@ -1243,8 +1280,8 @@
     const step = () => {
       if (token !== tok || state.real || i > to) return;
       if (i !== si) activate(i);
-      const ws = sents[i].text.match(/\S+/g) || [];
-      if (k < ws.length) { setWord(k); later(step, wordMs({ t: ws[k++] })); }
+      const ws = sents[i].ws;
+      if (k < ws.length) { setWord(k); later(step, wordMs(ws[k++])); }
       else { i++; k = 0; step(); }
     };
     step();
@@ -1274,11 +1311,12 @@
     const v = voices.find(x => x.voiceURI === settings.voiceURI) || bestVoice();
     // Whole passages flow far better than single sentences. Some streamed voices cut out on long text, so those stay short.
     const lim = !v || v.localService || /online|natural/i.test(v.name) ? 1000 : 180;
-    const first = si, offs = [0]; let to = si, text = s.text;
-    while (to + 1 < sents.length && text.length + sents[to + 1].text.length <= lim) {
+    const first = si, offs = [0]; let to = si, text = s.say;
+    while (to + 1 < sents.length && text.length + sents[to + 1].say.length <= lim) {
       if (sents[to + 1].el.parentNode !== sents[to].el.parentNode && !/\s$/.test(text)) text += ' \n';
-      offs.push(text.length); text += sents[++to].text;
+      offs.push(text.length); text += sents[++to].say;
     }
+    if (!text.trim()) { later(() => { si = to; advance(token); }, 0); return; } // everything here is skipped
     const u = new SpeechSynthesisUtterance(text);
     if (v) { u.voice = v; u.lang = v.lang; }
     u.rate = settings.rate;
@@ -1393,10 +1431,19 @@
     $('widthR').value = settings.width; $('widthO').textContent = settings.width + 'ch';
     $('wordC').checked = settings.word; $('focusC').checked = settings.focus; $('scrollC').checked = settings.scroll;
     $('voiceC').checked = settings.voice && (!!synth || !!tts); $('voiceC').disabled = !synth && !tts;
+    const sk = S.options(settings.skip);
+    document.querySelectorAll('[data-skip]').forEach(c => { c.checked = !!sk[c.dataset.skip]; });
     $('rateSel').value = String(settings.rate);
     if (!$('rateSel').value) { settings.rate = 1; $('rateSel').value = '1'; }
   }
   function restartIfPlaying() { if (playing) speakCurrent(); }
+  function reskip() { // the Skip text choices changed: rebuild what is spoken, keep the place
+    models = new Map(); chunkCache = new Map();
+    if (!book.chapters[ci]) return;
+    const at = si, top = stage.scrollTop;
+    renderChapter(at); stage.scrollTop = top;
+    restartIfPlaying();
+  }
 
   /* ---------- small UI helpers ---------- */
   function status(msg, err) { const el = $('status'); el.textContent = msg; el.classList.toggle('err', !!err); }
@@ -1466,6 +1513,10 @@
   $('scrollC').onchange = e => { settings.scroll = e.target.checked; saveSettings(); };
   $('wordC').onchange = e => { settings.word = e.target.checked; saveSettings(); activate(si, false); restartIfPlaying(); };
   $('voiceC').onchange = e => { settings.voice = e.target.checked; saveSettings(); note(''); restartIfPlaying(); };
+  document.querySelectorAll('[data-skip]').forEach(c => c.onchange = () => {
+    settings.skip = Array.from(document.querySelectorAll('[data-skip]')).filter(x => x.checked).map(x => x.dataset.skip).join(',');
+    saveSettings(); stampPref('skip'); reskip();
+  });
 
   document.addEventListener('keydown', e => {
     if (e.target.closest('input, textarea, select, dialog') || e.metaKey || e.ctrlKey || e.altKey) return;
