@@ -62,6 +62,37 @@ made by hand on any device wins (kept in `prefs.json`). In Settings, "Remove fro
 only (this device then stops taking it from Drive until you save a key here again); "Remove from all devices" clears
 it everywhere on their next sync. Signing out keeps the key on that device.
 
+## Book folders
+
+The Library lists each book once. A book that came as separate chapter files is a folder: tap it and its chapters
+open as a contents list, numbered the way the book numbers them (1, 2, 3 … 10, not 1, 10, 2), with front matter such
+as a preface first and an index or appendix last. A book that is one file opens to the chapters inside it.
+
+How chapters find their book (`shelf.js`):
+
+- From the file name: "Kandarpa Handbook - Chapter 3 - Arterial Access", "Ch03_Arterial_Access", "Abrams Chapter IV
+  Aortic Arch" give the book, the chapter number and a tidy title. ScienceDirect/ClinicalKey downloads
+  (1-s2.0-B978…-main.pdf) are matched by the book's ISBN in the name, titled from the PDF's own title, and the book is
+  named from the PDF's subject line.
+- From the first page, when the name says nothing: a line such as "Chapter 12 Thoracic Duct Embolization".
+- Two or more chapters of the same book become a folder by themselves; "Kandarpa" and "Kandarpa Handbook" count as the
+  same book. Files added together that are numbered chapters, or share a name, go into one folder (named "New book"
+  when they share nothing, ready to rename).
+- A PDF with bookmarks is split at its bookmarks, so its chapters carry their real titles; other PDFs are read ten
+  pages at a time as before.
+
+In the reader, a chapter in a folder shows the book's title, "Chapter 3" and the chapter's title; the contents list at
+the top lists the whole book, and Next chapter and continuous listening carry on into the next chapter file.
+
+Edit on any book: rename it, change a chapter's number or title, move chapters up or down, move a chapter to another
+book (or a new one, or on its own), add a chapter from the library, remove one, or take a folder apart (its chapters
+stay in the library). "New book folder" starts an empty one.
+
+The arrangement is kept apart from the books (`lectern.lib` in the browser, `library.json` in Drive sync), so
+reorganizing never re-uploads a book. Nothing is written until you change something: every device works out the same
+folders from the same books, and a change made by hand wins on every device (newest change per folder and per chapter).
+App versions from before folders ignore `library.json` and keep the plain list. Backup files include the folders.
+
 ## Word highlight
 
 Google's voices send audio only, with no word positions, so the word highlight is timed from the audio itself
@@ -91,13 +122,14 @@ How each is found (`skip.js`):
 Superscripts and vertical text are recorded when a book is added, so books added before this feature need adding again
 for those two; brackets and addresses work on every book.
 
-Tests: `node --test tests/sync.test.js tests/align.test.js tests/skip.test.js`
+Tests: `node --test tests/*.test.js`
 
 ## How it works
 
 - `index.html`, `app.css`, `app.js`: the whole app.
 - `sync.js`: Google Drive sync (merge rules and a small Drive client); `tests/` covers it.
 - `skip.js`: Skip text (what is left out of narration, and sentence splitting); `tests/skip.test.js` covers it.
+- `shelf.js`: book folders (which book a chapter belongs to, its number, the order); `tests/shelf.test.js` covers it.
 - `sw.js`, `manifest.webmanifest`, `icons/`: offline support and installation.
 - `vendor/`: pdf.js 3.11.174 and JSZip 3.10.1, used to open PDF, EPUB and Word files.
 

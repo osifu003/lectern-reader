@@ -5,6 +5,7 @@
 
   const STATE = 'state.json';
   const PREFS = 'prefs.json';
+  const LIB = 'library.json'; // book folders and chapter order (shelf.js); older app versions never read or write it
   // Voice and reading settings that follow the reader to every device (skip: the Skip text choices); display settings stay per device.
   const PREF_KEYS = ['gkey', 'gengine', 'glang', 'gstyle', 'voiceURI', 'rate', 'skip'];
   const TOMB_DAYS = 180;
@@ -60,6 +61,30 @@
     return { prefs, pulled, remoteChanged };
   }
   const sameVal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  // Book folders and chapter placement: each folder and each item's entry carries the time it was changed ({..., t});
+  // the newest wins, entry by entry. Entries of removed books go with them; a folder taken apart is remembered
+  // (gone) for TOMB_DAYS so it isn't put back together.
+  function mergeLib(local, remote, tombs, now) {
+    now = now || Date.now(); tombs = tombs || {};
+    const lib = { folders: {}, items: {} };
+    let remoteChanged = false, localChanged = false;
+    const key = o => JSON.stringify(sortKeys(o));
+    for (const kind of ['folders', 'items']) {
+      const L = (local && local[kind]) || {}, R = (remote && remote[kind]) || {};
+      for (const id of new Set([...Object.keys(L), ...Object.keys(R)])) {
+        const l = L[id], r = R[id];
+        const lt = l ? +l.t || 0 : -1, rt = r ? +r.t || 0 : -1;
+        const w = lt > rt ? l : rt > lt ? r : (key(l) >= key(r) ? l : r);
+        const drop = !w || (kind === 'items' && tombs[id]) || (kind === 'folders' && w.gone && now - (+w.t || 0) > TOMB_DAYS * 864e5);
+        if (drop) { if (r) remoteChanged = true; if (l) localChanged = true; continue; }
+        lib[kind][id] = w;
+        if (!r || key(w) !== key(r)) remoteChanged = true;
+        if (!l || key(w) !== key(l)) localChanged = true;
+      }
+    }
+    return { lib, remoteChanged, localChanged };
+  }
 
   // Decide what moves where. local: [{id, v, synced}]; remote: [{fileId, id, v, modified}]; tombs: merged tombstones {id: time}.
   function planSync(local, remote, tombs) {
@@ -144,7 +169,8 @@
 
   // One full pass: list Drive, merge positions and deletions, move books both ways.
   // store: { books(), positions(), tombs(), putBook(b), dropBook(id), markSynced(id, v), setPositions(p, tombs), clearTombs(ids),
-  //         prefs() -> { values: {k: {v, t}}, skip: [k] }, setPrefs({k: {v, t}}) } (the last two optional)
+  //         prefs() -> { values: {k: {v, t}}, skip: [k] }, setPrefs({k: {v, t}}), lib() -> { folders, items }, setLib(lib) }
+  //         (prefs, setPrefs, lib and setLib optional)
   async function runSync(drive, store, now) {
     const files = await drive.list();
     const stateFile = files.find(f => f.name === STATE);
@@ -189,9 +215,18 @@
       result.prefs = Object.keys(m.pulled);
       if (result.prefs.length) await store.setPrefs(m.pulled);
     }
+
+    if (store.lib) { // book folders and chapter order, in their own file so older app versions never overwrite them
+      const lf = files.find(f => f.name === LIB);
+      const remote = lf ? await drive.read(lf.id).catch(e => { if (e.code === 'missing') return {}; throw e; }) : {};
+      const m = mergeLib(store.lib(), (remote && remote.lib) || {}, merged.tombs, now);
+      if (m.remoteChanged || !lf) await drive.write(lf ? lf.id : '', LIB, { lectern: 1, lib: m.lib }, { kind: 'lib' });
+      result.lib = m.localChanged;
+      if (m.localChanged) await store.setLib(m.lib);
+    }
     return result;
   }
 
-  const api = { mergeState, mergePrefs, planSync, createDrive, runSync, bookVersion, STATE, PREFS, PREF_KEYS };
+  const api = { mergeState, mergePrefs, mergeLib, planSync, createDrive, runSync, bookVersion, STATE, PREFS, LIB, PREF_KEYS };
   if (typeof module === 'object' && module.exports) module.exports = api; else root.LecternSync = api;
 })(typeof self !== 'undefined' ? self : this);

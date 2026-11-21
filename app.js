@@ -4,6 +4,7 @@
   const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
   const WPM = 175;
   const S = window.LecternSkip; // skip.js: what is left out of narration
+  const Shelf = window.LecternShelf; // shelf.js: book folders and chapter order
 
   /* ---------- sample (public domain: Lewis Carroll, 1865) ---------- */
   const SAMPLE = {
@@ -66,6 +67,8 @@
   const DEFAULTS = { font: 'book', size: 20, lh: 1.7, width: 66, word: true, focus: false, scroll: true, voice: true, rate: 1, voiceURI: '', gkey: '', glang: '', gengine: '', gstyle: 'Read this aloud as a warm, natural audiobook narrator:', theme: 'auto', skip: 'square,curly,url,sup,vert' };
   const settings = Object.assign({}, DEFAULTS, ls.get('lectern.settings', {}));
   let positions = ls.get('lectern.pos', {});
+  let lib = readLib(); // book folders and chapter placement (shelf.js); synced as library.json
+  const openShelves = new Set(ls.get('lectern.shelfOpen', [])); let editing = '';
   let books = [SAMPLE];
   let book = SAMPLE, ci = 0, si = 0;
   let sents = [], suffix = [];
@@ -133,6 +136,38 @@
       if (t) out.push({ t, h: /^h[1-3]$/i.test(el.localName) });
     });
     return out;
+  }
+
+  /* ---------- book folders ---------- */
+  function readLib() {
+    const v = ls.get('lectern.lib', null);
+    return { folders: (v && v.folders) || {}, items: (v && v.items) || {} };
+  }
+  function saveLib() { ls.set('lectern.lib', lib); syncSoon(); }
+  const saveOpen = () => ls.set('lectern.shelfOpen', [...openShelves]);
+  const userBooks = () => books.filter(b => !b.sample);
+  const shelfView = () => Shelf.view(userBooks(), lib, S.bare);
+  function placeOf(id) { // { shelf, idx, item } for a book in the library, or null for the built-in sample
+    const w = shelfView().where.get(id);
+    return w ? Object.assign({ item: w.shelf.items[w.idx] }, w) : null;
+  }
+  // Before the reader changes a folder that was put together automatically, write its arrangement down, so it stays
+  // exactly as they see it on every device.
+  function materialize(shelfId, t) {
+    t = t || Date.now();
+    const s = shelfView().shelves.find(x => x.id === shelfId);
+    if (!s || s.single) return s;
+    if (!lib.folders[s.id] || lib.folders[s.id].gone) lib.folders[s.id] = { title: s.title, key: s.key || undefined, t };
+    for (const x of s.items) if (!lib.items[x.b.id]) lib.items[x.b.id] = { f: s.id, t };
+    return s;
+  }
+  function setItem(id, patch) {
+    const w = placeOf(id); if (!w) return;
+    if (!w.shelf.single) materialize(w.shelf.id);
+    const cur = lib.items[id] || { f: w.shelf.single ? '' : w.shelf.id };
+    const next = Object.assign({}, cur, patch, { t: Date.now() });
+    for (const k in next) if (next[k] === undefined) delete next[k];
+    lib.items[id] = next;
   }
 
   /* ---------- importers ---------- */
@@ -208,29 +243,28 @@
     });
     return { title: name, chapters: chaptersFromBlocks(blocks, name) };
   }
-  async function parsePdf(file, name) {
-
+  async function parsePdf(file, name, batch) {
     await loadScript(PDFJS);
     pdfjsLib.GlobalWorkerOptions.workerSrc = PDFWK;
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false, disableFontFace: true }).promise;
-    const chapters = []; const STEP = 10;
-    for (let start = 1; start <= pdf.numPages; start += STEP) {
-      const end = Math.min(pdf.numPages, start + STEP - 1);
-      const lines = [];
-      for (let n = start; n <= end; n++) {
-        status(`Reading page ${n} of ${pdf.numPages}…`);
-        const page = await pdf.getPage(n);
-        const tc = await page.getTextContent();
-        const kinds = S.pdfKinds(tc.items, tc.styles); // superscripts, subscripts and vertical text keep a mark, for Skip text
-        let line = '';
-        tc.items.forEach((it, x) => {
-          if (typeof it.str !== 'string') return;
-          line += kinds[x] ? S.wrap(it.str, kinds[x]) : S.scrub(it.str);
-          if (it.hasEOL) { lines.push(line); line = ''; }
-        });
-        lines.push(line, '');
-        page.cleanup();
-      }
+    const pages = [null]; // the text lines of each page
+    for (let n = 1; n <= pdf.numPages; n++) {
+      status(`${batch || ''}Reading page ${n} of ${pdf.numPages}…`);
+      const page = await pdf.getPage(n);
+      const tc = await page.getTextContent();
+      const kinds = S.pdfKinds(tc.items, tc.styles); // superscripts, subscripts and vertical text keep a mark, for Skip text
+      const lines = []; let line = '';
+      tc.items.forEach((it, x) => {
+        if (typeof it.str !== 'string') return;
+        line += kinds[x] ? S.wrap(it.str, kinds[x]) : S.scrub(it.str);
+        if (it.hasEOL) { lines.push(line); line = ''; }
+      });
+      lines.push(line, '');
+      pages.push(lines);
+      page.cleanup();
+    }
+    const paragraphs = (from, to) => {
+      const lines = [].concat(...pages.slice(from, to + 1));
       const lens = lines.map(l => S.bare(l).trim().length).filter(Boolean).sort((a, b) => a - b);
       const full = lens.length ? lens[Math.floor(lens.length * 0.9)] : 0;
       const paras = []; let cur = '';
@@ -244,15 +278,59 @@
         if (/[.!?]["”’)]?$/.test(lb) && lb.length < full * 0.8) flush();
       }
       flush();
-      if (paras.length) chapters.push({ title: start === end ? `Page ${start}` : `Pages ${start}–${end}`, paras });
+      return paras;
+    };
+    const span = (a, b) => a === b ? `Page ${a}` : `Pages ${a}–${b}`;
+    const chapters = [];
+    const marks = await pdfOutline(pdf); // the PDF's own bookmarks give real chapter titles when it has them
+    if (marks.length >= 2) {
+      if (marks[0].page > 1) marks.unshift({ page: 1, title: 'Opening pages' });
+      marks.forEach((m, i) => {
+        const end = i + 1 < marks.length ? marks[i + 1].page - 1 : pdf.numPages;
+        const parts = Math.ceil((end - m.page + 1) / 30); // very long sections are read in parts
+        for (let k = 0; k < parts; k++) {
+          const a = m.page + k * 30, b = Math.min(end, a + 29);
+          const paras = paragraphs(a, b);
+          if (paras.length) chapters.push({ title: parts > 1 ? `${m.title} (part ${k + 1} of ${parts})` : m.title, paras });
+        }
+      });
+    } else {
+      for (let start = 1; start <= pdf.numPages; start += 10) {
+        const end = Math.min(pdf.numPages, start + 9);
+        const paras = paragraphs(start, end);
+        if (paras.length) chapters.push({ title: span(start, end), paras });
+      }
     }
     const chars = chapters.reduce((a, c) => a + c.paras.join('').length, 0);
     if (chars / pdf.numPages < 40) { // image-only pages: offer to read them with Cloud Vision
       if (!settings.gkey) throw new Error('This PDF is scanned images with no selectable text. Add your Google key in Settings and the app can read it.');
+      if (batch) throw new Error(`“${name}” is scanned pages. Add it on its own to read it with Google.`);
       offerOcr({ title: name, key: 'pdf:' + file.name + ':' + file.size, n: pdf.numPages, blob: n => pdfPageBlob(pdf, n) });
       return null;
     }
-    return { title: name, chapters };
+    let info = {};
+    try { info = (await pdf.getMetadata()).info || {}; } catch {}
+    return { title: name, src: { file: file.name, title: clean(String(info.Title || '')).slice(0, 200), subject: clean(String(info.Subject || '')).slice(0, 300) }, chapters };
+  }
+  async function pdfOutline(pdf) { // [{ page, title }] from the top level of the bookmarks (or the level under a single top entry)
+    try {
+      let ol = await pdf.getOutline();
+      if (!ol || !ol.length) return [];
+      if (ol.length === 1 && ol[0].items && ol[0].items.length > 1) ol = ol[0].items;
+      const out = [];
+      for (const it of ol.slice(0, 400)) {
+        let dest = it.dest;
+        if (typeof dest === 'string') dest = await pdf.getDestination(dest);
+        if (!Array.isArray(dest) || dest[0] == null) continue;
+        const page = typeof dest[0] === 'number' ? dest[0] + 1 : (await pdf.getPageIndex(dest[0])) + 1;
+        const title = clean(S.scrub(String(it.title || '')));
+        if (!title || !(page >= 1 && page <= pdf.numPages)) continue;
+        if (out.length && out[out.length - 1].page === page) continue; // two bookmarks on one page: the first names it
+        out.push({ page, title });
+      }
+      out.sort((a, b) => a.page - b.page);
+      return out.filter((m, i) => !i || m.page !== out[i - 1].page);
+    } catch { return []; }
   }
   async function pdfPageBlob(pdf, n) {
     const page = await pdf.getPage(n);
@@ -324,16 +402,21 @@
     status(msg, !!why && why !== OCR_COPY.cancelled);
   }
   async function addBookQuiet(b) {
-    b.id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    b.id = newId();
     b.added = Date.now(); books.push(b);
     await idb('readwrite', s => s.put(b));
     syncSoon(b);
     openBook(b.id);
   }
+  const newId = () => 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   async function importFiles(files) {
     if (ocrCtl) { status('Wait for the current pages to finish, or press Stop.', true); return; }
     const imgs = files.filter(f => /^image\//.test(f.type) || /\.(jpe?g|png|webp|gif|heic)$/i.test(f.name));
-    if (!imgs.length) { $('ocrBox').hidden = true; ocrJob = null; return /\.json$/i.test(files[0].name) ? importBackup(files[0]) : importFile(files[0]); }
+    if (!imgs.length) {
+      $('ocrBox').hidden = true; ocrJob = null;
+      if (/\.json$/i.test(files[0].name)) return importBackup(files[0]);
+      return importDocs(files.filter(f => !/\.json$/i.test(f.name)));
+    }
     if (!settings.gkey) { status('Reading page photos needs your Google key. Add it in Settings.', true); return; }
     const okTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     const good = imgs.filter(f => !okTypes.length || okTypes.includes(f.type));
@@ -342,29 +425,66 @@
     offerOcr({ images: true, title: good[0].name.replace(/\.[^.]+$/, '') + (good.length > 1 ? ` (${good.length} pages)` : ''), key: 'img:' + Date.now(), n: good.length, blob: n => shrinkImage(good[n - 1]) });
     runOcr(1, good.length);
   }
-
-  async function importFile(file) {
+  // Several files at once (a book's chapters, say) are all added; chapters of one book go into that book's folder.
+  async function importDocs(files) {
+    files = files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const added = [], failed = [];
+    for (let i = 0; i < files.length; i++) {
+      const tag = files.length > 1 ? `${i + 1} of ${files.length} · ` : '';
+      try { const b = await importFile(files[i], tag); if (b) added.push(b); }
+      catch (e) { failed.push(e && e.message ? e.message : `“${files[i].name}” could not be opened.`); if (files.length === 1) { status(failed[0], true); return; } }
+    }
+    if (!added.length) { if (failed.length) status(failed.join(' '), true); return; }
+    const place = Shelf.placeBatch(added, lib, userBooks(), S.bare);
+    if (place) {
+      const t = Date.now();
+      if (!place.existing) lib.folders[place.id] = { title: place.title, key: place.key || undefined, t };
+      else materialize(place.id, t);
+      for (const b of added) lib.items[b.id] = { f: place.id, t };
+      saveLib();
+    }
+    const v = shelfView(), w = v.where.get(added[0].id);
+    const first = place ? v.where.get(added[0].id).shelf.items.find(x => added.includes(x.b)).b : added[0];
+    openBook(first.id);
+    const fail = failed.length ? ' ' + failed.join(' ') : '';
+    const keep = !persistOk ? ' This browser is not saving books, so they will be gone when you close the page.' : '';
+    if (place || (w && !w.shelf.single)) {
+      const sh = v.where.get(first.id).shelf;
+      openShelves.add(sh.id); saveOpen();
+      if (sh.title === 'New book') editing = sh.id;
+      renderBooks();
+      status((added.length === 1 ? `Added “${v.where.get(added[0].id).shelf.items[v.where.get(added[0].id).idx].label}” to “${sh.title}”.` : `Added ${added.length} chapters to “${sh.title}”.`)
+        + (sh.title === 'New book' ? ' Give the book its name above.' : '') + keep + fail, !!fail);
+      return;
+    }
+    status((added.length === 1 ? `Added “${added[0].title}”.` : `Added ${added.length} books.`) + keep + fail, !!fail);
+    if (!fail) $('libraryDlg').close();
+  }
+  async function importFile(file, tag) {
     const name = file.name.replace(/\.[^.]+$/, '');
     const ext = (file.name.match(/\.([^.]+)$/) || [, ''])[1].toLowerCase();
-    try {
-      status('Opening ' + file.name + '…');
-      let b;
-      if (ext === 'epub') b = await parseEpub(file, name);
-      else if (ext === 'pdf') b = await parsePdf(file, name);
-      else if (ext === 'docx') b = await parseDocx(file, name);
-      else if (ext === 'doc') throw new Error('Older .doc files are not supported. Save it as .docx or PDF and try again.');
-      else if (ext === 'html' || ext === 'htm') {
-        const doc = new DOMParser().parseFromString(await file.text(), 'text/html');
-        b = { title: clean(doc.title) || name, chapters: chaptersFromBlocks(domBlocks(doc.body), name) };
-      } else b = { title: name, chapters: chaptersFromBlocks(textToBlocks(await file.text()), name) };
-      if (b) await addBook(b);
-    } catch (e) {
-      status(e && e.message ? e.message : 'That file could not be opened.', true);
-    }
+    status(tag + 'Opening ' + file.name + '…');
+    let b;
+    if (ext === 'epub') b = await parseEpub(file, name);
+    else if (ext === 'pdf') b = await parsePdf(file, name, tag);
+    else if (ext === 'docx') b = await parseDocx(file, name);
+    else if (ext === 'doc') throw new Error(`“${file.name}”: older .doc files are not supported. Save it as .docx or PDF and try again.`);
+    else if (ext === 'html' || ext === 'htm') {
+      const doc = new DOMParser().parseFromString(await file.text(), 'text/html');
+      b = { title: clean(doc.title) || name, chapters: chaptersFromBlocks(domBlocks(doc.body), name) };
+    } else b = { title: name, chapters: chaptersFromBlocks(textToBlocks(await file.text()), name) };
+    if (!b) return null;
+    if (!b.chapters || !b.chapters.length) throw new Error(`No readable text was found in “${file.name}”.`);
+    if (!b.src) b.src = { file: file.name };
+    b.id = newId(); b.added = Date.now();
+    books.push(b);
+    await idb('readwrite', s => s.put(b));
+    syncSoon(b);
+    return b;
   }
-  async function addBook(b) {
+  async function addBook(b) { // pasted text
     if (!b.chapters || !b.chapters.length) throw new Error('No readable text was found in that file.');
-    b.id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    b.id = newId();
     b.added = Date.now();
     books.push(b);
     await idb('readwrite', s => s.put(b));
@@ -385,26 +505,55 @@
     }
     return m;
   }
-  function openBook(id) {
+  function openBook(id, at) {
     stop(); models = new Map(); chunkCache = new Map();
     book = books.find(b => b.id === id) || books[0];
-    const p = positions[book.id] || { c: 0, s: 0 };
-    ci = Math.min(p.c || 0, book.chapters.length - 1);
+    const p = at || positions[book.id] || { c: 0, s: 0 };
+    ci = Math.min(Math.max(0, p.c || 0), book.chapters.length - 1);
     ls.set('lectern.last', book.id);
-    $('bookTitle').textContent = book.title;
-    const sel = $('chapterSel'); sel.textContent = '';
-    book.chapters.forEach((c, i) => { const o = document.createElement('option'); o.value = i; o.textContent = c.title.length > 60 ? c.title.slice(0, 58) + '…' : c.title; sel.appendChild(o); });
+    header();
     renderChapter(p.s || 0);
     renderBooks();
+  }
+  // The top bar: the book's title, and a contents list. A chapter that sits in a book folder lists the whole book.
+  function header() {
+    const w = placeOf(book.id);
+    $('bookTitle').textContent = w && !w.shelf.single ? w.shelf.title : w ? w.item.label : book.title;
+    const sel = $('chapterSel'); sel.textContent = '';
+    const cut = t => t.length > 60 ? t.slice(0, 58) + '…' : t;
+    const opt = (parent, value, text) => { const o = document.createElement('option'); o.value = value; o.textContent = cut(text); parent.appendChild(o); };
+    if (w && !w.shelf.single) {
+      for (const x of w.shelf.items) {
+        const name = (x.n != null ? x.n + '. ' : '') + x.label;
+        if (x.b.chapters.length === 1) { opt(sel, x.b.id + ':0', name); continue; }
+        const g = document.createElement('optgroup'); g.label = cut(name);
+        x.b.chapters.forEach((c, i) => opt(g, x.b.id + ':' + i, c.title));
+        sel.appendChild(g);
+      }
+    } else book.chapters.forEach((c, i) => opt(sel, book.id + ':' + i, c.title));
+  }
+  function neighbour(step) { // the chapter before or after this one in its book folder
+    const w = placeOf(book.id);
+    if (!w || w.shelf.single) return null;
+    const x = w.shelf.items[w.idx + step];
+    return x ? x.b : null;
   }
   function renderChapter(startAt) {
     const ch = book.chapters[ci];
     activeEl = null; wordOn = null; words = [];
     reader.textContent = ''; sents = [];
+    const w = placeOf(book.id), inShelf = w && !w.shelf.single;
     const eb = document.createElement('p'); eb.className = 'eyebrow';
-    eb.textContent = `${book.sample ? 'Sample · ' : ''}Chapter ${ci + 1} of ${book.chapters.length}`;
-    const h = document.createElement('h2'); h.textContent = ch.title;
+    const h = document.createElement('h2');
     const frag = document.createDocumentFragment(); frag.append(eb, h);
+    if (inShelf) { // "Kandarpa Handbook · Chapter 3", the chapter's title, then which part of it this is
+      eb.textContent = w.shelf.title + (w.item.n != null ? ` · Chapter ${w.item.n}` : '');
+      h.textContent = w.item.label;
+      if (book.chapters.length > 1) { const sub = document.createElement('p'); sub.className = 'subhead'; sub.textContent = `${ch.title} · ${ci + 1} of ${book.chapters.length}`; frag.appendChild(sub); }
+    } else {
+      eb.textContent = `${book.sample ? 'Sample · ' : ''}Chapter ${ci + 1} of ${book.chapters.length}`;
+      h.textContent = ch.title;
+    }
     let p = null, lastP = -1;
     for (const s of model(ci)) {
       if (s.p !== lastP) { p = document.createElement('p'); frag.appendChild(p); lastP = s.p; }
@@ -416,10 +565,10 @@
     reader.appendChild(frag);
     suffix = new Array(sents.length + 1).fill(0);
     for (let i = sents.length - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + sents[i].n;
-    $('chapterSel').value = ci; mediaMeta();
+    $('chapterSel').value = book.id + ':' + ci; mediaMeta();
     $('seek').max = Math.max(0, sents.length - 1);
-    $('prevCh').hidden = ci === 0;
-    $('nextCh').hidden = ci >= book.chapters.length - 1;
+    $('prevCh').hidden = ci === 0 && !neighbour(-1);
+    $('nextCh').hidden = ci >= book.chapters.length - 1 && !neighbour(1);
     si = Math.min(Math.max(0, startAt || 0), Math.max(0, sents.length - 1));
     stage.scrollTop = 0;
     activate(si, si > 0);
@@ -492,36 +641,208 @@
     const mins = suffix[si] / (WPM * settings.rate);
     $('leftLabel').textContent = mins < 1 ? 'under 1 min left' : `${Math.round(mins)} min left`;
   }
+  /* ---------- library: book folders, each opening to its contents ---------- */
+  const mk = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  function libChanged() { // the arrangement changed by hand here
+    saveLib(); header();
+    if (!playing) renderChapter(si); else $('chapterSel').value = book.id + ':' + ci;
+    renderBooks();
+  }
   function renderBooks() {
     const ul = $('books'); ul.textContent = '';
-    for (const b of books) {
-      const li = document.createElement('li'); if (b.id === book.id) li.className = 'cur';
-      const open = document.createElement('button'); open.type = 'button'; open.className = 'open';
-      const t = document.createElement('span'); t.className = 'bt'; t.textContent = b.title;
-      const m = document.createElement('span'); m.className = 'bm';
-      const p = positions[b.id];
-      m.textContent = `${b.chapters.length} chapter${b.chapters.length === 1 ? '' : 's'}` + (p ? ` · at chapter ${Math.min(p.c, b.chapters.length - 1) + 1}` : '') + (b.sample ? ' · built-in example' : '');
-      open.append(t, m);
-      open.onclick = () => { openBook(b.id); $('libraryDlg').close(); };
-      li.appendChild(open);
-      if (!b.sample) {
-        const del = document.createElement('button'); del.type = 'button'; del.className = 'btn quiet'; del.textContent = 'Remove';
-        del.onclick = async () => {
-          if (del.dataset.sure !== '1') { del.dataset.sure = '1'; del.textContent = 'Remove for good?'; setTimeout(() => { del.dataset.sure = ''; del.textContent = 'Remove'; }, 3500); return; }
-          books = books.filter(x => x.id !== b.id); delete positions[b.id]; ls.set('lectern.pos', positions);
-          await idb('readwrite', s => s.delete(b.id));
-          if (gdrive) { const t = readTombs(); t[b.id] = Date.now(); ls.set('lectern.tomb', t); syncSoon(); }
-          if (book.id === b.id) openBook(books[0].id); else renderBooks();
-        };
-        li.appendChild(del);
-      }
-      ul.appendChild(li);
+    const v = shelfView(), here = v.where.get(book.id);
+    const list = v.shelves.concat([{ id: SAMPLE.id, title: SAMPLE.title, single: true, sample: true, items: [{ b: SAMPLE, label: SAMPLE.title }] }]);
+    if (editing && !list.some(x => x.id === editing)) editing = '';
+    for (const sh of list) ul.appendChild(shelfEl(sh, sh.sample ? book.id === SAMPLE.id : !!here && here.shelf.id === sh.id, v));
+  }
+  function shelfMeta(sh) {
+    if (!sh.single) {
+      if (!sh.items.length) return 'No chapters yet';
+      let last = null; // the chapter read most recently
+      for (const x of sh.items) { const p = positions[x.b.id]; if (p && (!last || (p.t || 0) > (positions[last.b.id].t || 0))) last = x; }
+      last = sh.items.find(x => x.b.id === book.id) || last; // the chapter open now
+      return plural(sh.items.length, 'chapter') + (last ? ' · reading ' + (last.n != null ? 'chapter ' + last.n : '“' + last.label + '”') : '');
     }
+    const b = sh.items[0].b, p = positions[b.id];
+    return plural(b.chapters.length, 'chapter') + (p && b.chapters.length > 1 ? ` · at chapter ${Math.min(p.c, b.chapters.length - 1) + 1}` : '') + (b.sample ? ' · built-in example' : '');
+  }
+  function shelfEl(sh, isCur, v) {
+    const li = mk('li', 'shelf' + (sh.single ? ' single' : ' folder') + (isCur ? ' cur' : ''));
+    if (editing === sh.id) { li.classList.add('open', 'editing'); li.append(...(sh.single ? editSingle(sh, v) : editFolder(sh, v))); return li; }
+    const open = openShelves.has(sh.id);
+    li.classList.toggle('open', open);
+    const head = mk('div', 'shelf-head');
+    const tog = mk('button', 'shelf-toggle'); tog.type = 'button'; tog.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const ico = mk('span', 'shelf-ico'); ico.setAttribute('aria-hidden', 'true');
+    ico.innerHTML = sh.single ? '<svg viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 11h7M9 15h7" stroke="currentColor" stroke-width="1.7"/></svg>'
+      : '<svg viewBox="0 0 24 24"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2h8.5A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+    const txt = mk('span', 'shelf-txt');
+    txt.append(mk('span', 'st', sh.title), mk('span', 'sm', shelfMeta(sh)));
+    const caret = mk('span', 'caret'); caret.setAttribute('aria-hidden', 'true');
+    caret.innerHTML = '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    tog.append(ico, txt, caret);
+    tog.onclick = () => { if (openShelves.has(sh.id)) openShelves.delete(sh.id); else openShelves.add(sh.id); saveOpen(); renderBooks(); };
+    head.appendChild(tog);
+    if (!sh.sample) {
+      const ed = mk('button', 'btn quiet edit', 'Edit'); ed.type = 'button';
+      ed.setAttribute('aria-label', 'Edit ' + sh.title);
+      ed.onclick = () => { editing = sh.id; renderBooks(); };
+      head.appendChild(ed);
+    }
+    li.appendChild(head);
+    if (open) li.appendChild(sh.single ? sectionsToc(sh.items[0].b) : chaptersToc(sh));
+    return li;
+  }
+  function tocRow(num, title, cur, onOpen, note) {
+    const row = mk('li', cur ? 'cur' : '');
+    const btn = mk('button', 'toc-row'); btn.type = 'button';
+    btn.append(mk('span', 'tn', num == null ? '' : String(num)), mk('span', 'tt', title));
+    if (note) btn.appendChild(mk('span', 'tm', note));
+    btn.onclick = () => { onOpen(); $('libraryDlg').close(); };
+    row.appendChild(btn);
+    return row;
+  }
+  function chaptersToc(sh) { // a book folder: its chapters, numbered as the book numbers them
+    const ol = mk('ol', 'toc');
+    if (!sh.items.length) { ol.appendChild(mk('li', 'toc-empty', 'Move chapters here with Edit, or add a book’s chapter files together.')); return ol; }
+    for (const x of sh.items) ol.appendChild(tocRow(x.n, x.label, x.b.id === book.id, () => openBook(x.b.id), x.b.id === book.id ? 'Reading' : ''));
+    return ol;
+  }
+  function sectionsToc(b) { // a book on its own: the chapters inside it
+    const ol = mk('ol', 'toc');
+    const p = positions[b.id];
+    b.chapters.forEach((c, i) => {
+      const cur = b.id === book.id && i === ci;
+      ol.appendChild(tocRow(i + 1, c.title, cur, () => openBook(b.id, p && p.c === i ? null : { c: i, s: 0 }), cur ? 'Reading' : ''));
+    });
+    return ol;
+  }
+
+  // Editing: names, chapter numbers, order, which book a chapter belongs to.
+  function editHead(sh, label) {
+    const head = mk('div', 'shelf-head edit-head');
+    const inp = mk('input', 'edit-title'); inp.type = 'text'; inp.value = sh.title; inp.setAttribute('aria-label', label);
+    inp.onchange = () => {
+      const t = clean(inp.value); if (!t) { inp.value = sh.title; return; }
+      if (sh.single) setItem(sh.items[0].b.id, { title: t === Shelf.niceCase(Shelf.tidy(sh.items[0].b.title)) ? undefined : t });
+      else { materialize(sh.id); lib.folders[sh.id] = Object.assign({}, lib.folders[sh.id], { title: t, t: Date.now() }); }
+      libChanged();
+    };
+    inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); };
+    const done = mk('button', 'btn primary', 'Done'); done.type = 'button';
+    done.onclick = () => { if (document.activeElement === inp) inp.onchange(); editing = ''; openShelves.add(sh.id); saveOpen(); renderBooks(); };
+    head.append(inp, done);
+    if (sh.title === 'New book') setTimeout(() => { if (inp.isConnected) { inp.focus(); inp.select(); } }, 30);
+    return head;
+  }
+  function moveSel(b, from, v) { // "Move to…": another book folder, a new one, or on its own
+    const sel = mk('select', 'move'); sel.setAttribute('aria-label', 'Move to another book');
+    const add = (value, text) => { const o = mk('option', '', text); o.value = value; sel.appendChild(o); };
+    add('', from.single ? 'Put in a book…' : 'Move to…');
+    for (const s of v.shelves) if (!s.single && s.id !== from.id) add(s.id, s.title);
+    add('__new', 'A new book…');
+    if (!from.single) add('__own', 'On its own');
+    sel.onchange = () => {
+      const to = sel.value; if (!to) return;
+      let target = to;
+      if (to === '__own') target = '';
+      else if (to === '__new') {
+        target = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        lib.folders[target] = { title: Shelf.detect(b, S.bare).book || 'New book', t: Date.now() };
+        editing = target;
+      } else materialize(to);
+      setItem(b.id, { f: target, o: undefined });
+      if (target) openShelves.add(target); saveOpen();
+      libChanged();
+    };
+    return sel;
+  }
+  function removeBtn(b) {
+    const del = mk('button', 'btn quiet danger', 'Remove'); del.type = 'button';
+    del.setAttribute('aria-label', 'Remove ' + b.title + ' from the library');
+    del.onclick = async () => {
+      if (del.dataset.sure !== '1') { del.dataset.sure = '1'; del.textContent = 'Remove for good?'; setTimeout(() => { del.dataset.sure = ''; del.textContent = 'Remove'; }, 3500); return; }
+      const w = placeOf(b.id);
+      if (w && !w.shelf.single) materialize(w.shelf.id); // the rest of its book stays together
+      books = books.filter(x => x.id !== b.id); delete positions[b.id]; ls.set('lectern.pos', positions);
+      delete lib.items[b.id]; ls.set('lectern.lib', lib);
+      await idb('readwrite', s => s.delete(b.id));
+      if (gdrive) { const t = readTombs(); t[b.id] = Date.now(); ls.set('lectern.tomb', t); }
+      syncSoon();
+      if (book.id === b.id) openBook(books[0].id); else { header(); renderBooks(); }
+    };
+    return del;
+  }
+  function editSingle(sh, v) {
+    const b = sh.items[0].b;
+    const acts = mk('div', 'edit-acts');
+    acts.append(moveSel(b, sh, v), removeBtn(b));
+    return [editHead(sh, 'Title'), acts];
+  }
+  function editFolder(sh, v) {
+    const ol = mk('ol', 'toc edit-list');
+    sh.items.forEach((x, i) => {
+      const row = mk('li', 'edit-row');
+      const numIn = mk('input', 'num'); numIn.type = 'text'; numIn.inputMode = 'numeric'; numIn.value = x.n == null ? '' : x.n;
+      numIn.placeholder = '#'; numIn.setAttribute('aria-label', 'Chapter number');
+      numIn.onchange = () => { const t = numIn.value.trim(), n = parseInt(t, 10); setItem(x.b.id, { n: t === '' || !(n >= 0) ? null : n }); libChanged(); };
+      const tIn = mk('input', 'etitle'); tIn.type = 'text'; tIn.value = x.label; tIn.setAttribute('aria-label', 'Chapter title');
+      tIn.onchange = () => { const t = clean(tIn.value); setItem(x.b.id, { title: t || undefined }); libChanged(); };
+      [numIn, tIn].forEach(el => { el.onkeydown = e => { if (e.key === 'Enter') el.blur(); }; });
+      const up = mk('button', 'btn icon-btn', '↑'); up.type = 'button'; up.disabled = i === 0; up.setAttribute('aria-label', 'Move up');
+      const dn = mk('button', 'btn icon-btn', '↓'); dn.type = 'button'; dn.disabled = i === sh.items.length - 1; dn.setAttribute('aria-label', 'Move down');
+      up.onclick = () => reorder(sh, i, -1); dn.onclick = () => reorder(sh, i, 1);
+      const line = mk('div', 'edit-line'); line.append(numIn, tIn);
+      const acts = mk('div', 'edit-acts'); acts.append(up, dn, moveSel(x.b, sh, v), removeBtn(x.b));
+      row.append(line, acts);
+      ol.appendChild(row);
+    });
+    const foot = mk('div', 'edit-acts edit-foot');
+    const loose = v.shelves.filter(s => s.single);
+    if (loose.length) {
+      const addSel = mk('select', 'move'); addSel.setAttribute('aria-label', 'Add a chapter from your library');
+      const o0 = mk('option', '', 'Add a chapter…'); o0.value = ''; addSel.appendChild(o0);
+      for (const s of loose) { const o = mk('option', '', s.title); o.value = s.items[0].b.id; addSel.appendChild(o); }
+      addSel.onchange = () => { if (!addSel.value) return; materialize(sh.id); setItem(addSel.value, { f: sh.id, o: undefined }); libChanged(); };
+      foot.appendChild(addSel);
+    }
+    if (sh.items.some(x => x.o != null)) {
+      const sortB = mk('button', 'btn', 'Sort by chapter number'); sortB.type = 'button';
+      sortB.onclick = () => { for (const x of sh.items) setItem(x.b.id, { o: undefined }); libChanged(); };
+      foot.appendChild(sortB);
+    }
+    const apart = mk('button', 'btn quiet danger', sh.items.length ? 'Take apart' : 'Delete this book'); apart.type = 'button';
+    apart.title = sh.items.length ? 'Its chapters stay in your library, each on its own' : '';
+    apart.onclick = () => {
+      if (apart.dataset.sure !== '1' && sh.items.length) { apart.dataset.sure = '1'; apart.textContent = 'Take apart? Chapters stay'; setTimeout(() => { apart.dataset.sure = ''; apart.textContent = 'Take apart'; }, 3500); return; }
+      materialize(sh.id);
+      for (const x of sh.items) setItem(x.b.id, { f: '', o: undefined });
+      lib.folders[sh.id] = Object.assign({}, lib.folders[sh.id], { gone: true, t: Date.now() });
+      editing = ''; openShelves.delete(sh.id); saveOpen();
+      libChanged();
+    };
+    foot.appendChild(apart);
+    return [editHead(sh, 'Book title'), ol, foot];
+  }
+  function reorder(sh, i, step) {
+    const j = i + step; if (j < 0 || j >= sh.items.length) return;
+    materialize(sh.id);
+    const ids = sh.items.map(x => x.b.id);
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    const t = Date.now();
+    ids.forEach((id, k) => { lib.items[id] = Object.assign({}, lib.items[id] || { f: sh.id }, { o: k, t }); });
+    libChanged();
+  }
+  function newShelf() {
+    const id = 'f' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    lib.folders[id] = { title: 'New book', t: Date.now() };
+    editing = id; openShelves.add(id); saveOpen(); saveLib(); renderBooks();
   }
 
   /* ---------- backup ---------- */
   function exportBackup() {
-    const data = { lectern: 1, saved: new Date().toISOString(), positions, books: books.filter(b => !b.sample).map(b => { const c = Object.assign({}, b); delete c.synced; return c; }) };
+    const data = { lectern: 1, saved: new Date().toISOString(), positions, lib, books: books.filter(b => !b.sample).map(b => { const c = Object.assign({}, b); delete c.synced; return c; }) };
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
     a.download = 'lectern-library.json'; document.body.appendChild(a); a.click(); a.remove();
@@ -539,7 +860,9 @@
       }
       ls.set('lectern.tomb', tombs);
       for (const id in data.positions || {}) { const r = data.positions[id], l = positions[id]; if (!l || (r.t || 0) > (l.t || 0)) positions[id] = r; }
-      ls.set('lectern.pos', positions); renderBooks(); syncSoon();
+      ls.set('lectern.pos', positions);
+      if (data.lib && SyncLib) { lib = SyncLib.mergeLib(lib, data.lib, {}).lib; ls.set('lectern.lib', lib); } // book folders come back too
+      header(); renderBooks(); syncSoon();
       status(n ? `Restored ${n} book${n === 1 ? '' : 's'} and your reading positions.` : 'Every book in that backup is already here. Reading positions were updated.');
     } catch (e) { status(e.message || 'That backup could not be read.', true); }
   }
@@ -583,6 +906,8 @@
     },
     clearTombs(ids) { const t = readTombs(); ids.forEach(id => delete t[id]); ls.set('lectern.tomb', t); },
     prefs: () => ({ values: Object.fromEntries(PREF_KEYS.map(k => [k, { v: prefValue(k), t: prefT[k] || 0 }])), skip: prefsLocal() }),
+    lib: () => JSON.parse(JSON.stringify(lib)),
+    async setLib(pulled) { lib = SyncLib.mergeLib(lib, pulled, {}).lib; ls.set('lectern.lib', lib); }, // keeps any change made here while syncing
     async setPrefs(pulled) { applyPulledPrefs(pulled); }
   };
 
@@ -683,6 +1008,10 @@
       } else if (newer || (cur !== book && r.downloadedIds.includes(book.id))) {
         openBook(book.id); if (newer) toast('Picked up where you left off on another device.');
       }
+    }
+    if (r.lib && books.some(b => b.id === book.id)) { // the arrangement changed on another device
+      header(); $('chapterSel').value = book.id + ':' + ci;
+      if (!playing) renderChapter(si);
     }
     if (r.downloaded || r.removed) {
       const parts = [];
@@ -1111,7 +1440,9 @@
   }
   function mediaMeta() {
     if (!('mediaSession' in navigator) || !window.MediaMetadata) return;
-    try { navigator.mediaSession.metadata = new MediaMetadata({ title: book.chapters[ci].title, artist: book.title, album: 'Lectern' }); } catch {}
+    const w = placeOf(book.id), inShelf = w && !w.shelf.single;
+    const title = inShelf ? (w.item.n != null ? w.item.n + '. ' : '') + w.item.label + (book.chapters.length > 1 ? ' · ' + book.chapters[ci].title : '') : book.chapters[ci].title;
+    try { navigator.mediaSession.metadata = new MediaMetadata({ title, artist: inShelf ? w.shelf.title : w ? w.item.label : book.title, album: 'Lectern' }); } catch {}
   }
 
   /* ---------- playback ---------- */
@@ -1269,7 +1600,7 @@
         calibrate(); pline = null;
         const n = nextLine();
         if (n) tts.add([lineArg(n)], pOpts()).catch(pErr(pgen));
-        else { stop(); toast('End of the book.'); }
+        else endOfItem();
       } else if (reason !== 'stopped' && reason !== 'replaced') haltPremium(reason);
     });
   }
@@ -1348,7 +1679,14 @@
     if (token !== tok) return;
     if (si + 1 < sents.length) { activate(si + 1); speakCurrent(); }
     else if (ci + 1 < book.chapters.length) { ci++; renderChapter(0); speakCurrent(); }
-    else { stop(); toast('End of the book.'); }
+    else endOfItem();
+  }
+  function endOfItem() { // a chapter of a book folder carries on into the next chapter
+    const nx = neighbour(1);
+    if (!nx) { stop(); toast('End of the book.'); return; }
+    openBook(nx.id, { c: 0, s: 0 });
+    const w = placeOf(nx.id); toast('Next: ' + (w.item.n != null ? `Chapter ${w.item.n}, ` : '') + w.item.label);
+    play();
   }
   function play() {
     if (!sents.length) return;
@@ -1377,7 +1715,13 @@
     if (playing) speakCurrent();
   }
   function goChapter(n) {
-    if (n < 0 || n >= book.chapters.length) return;
+    if (n < 0 || n >= book.chapters.length) { // past either end: the chapter before or after it in the book folder
+      const nb = neighbour(n < 0 ? -1 : 1); if (!nb) return;
+      const was = playing;
+      openBook(nb.id, { c: n < 0 ? nb.chapters.length - 1 : 0, s: 0 });
+      if (was) play();
+      return;
+    }
     const was = playing; if (was) { tok++; clearTimers(); try { synth && synth.cancel(); } catch {} }
     ci = n; renderChapter(0);
     if (was) speakCurrent();
@@ -1456,7 +1800,13 @@
   $('prevBtn').onclick = () => jump(si - 1);
   $('nextBtn').onclick = () => { if (si + 1 < sents.length) jump(si + 1); else goChapter(ci + 1); };
   $('seek').oninput = e => jump(+e.target.value);
-  $('chapterSel').onchange = e => goChapter(+e.target.value);
+  $('chapterSel').onchange = e => {
+    const v = e.target.value, k = v.lastIndexOf(':'), id = v.slice(0, k), c = +v.slice(k + 1);
+    if (id === book.id) { goChapter(c); return; }
+    const was = playing;
+    openBook(id, c === ((positions[id] || {}).c || 0) ? null : { c, s: 0 });
+    if (was) play();
+  };
   $('prevCh').onclick = () => goChapter(ci - 1);
   $('nextCh').onclick = () => goChapter(ci + 1);
   $('rateSel').onchange = e => {
@@ -1563,6 +1913,7 @@
   window.addEventListener('online', () => { if (gdrive && tokenOk()) syncSoon(500); });
   setInterval(() => { if (gdrive && tokenOk() && document.visibilityState === 'visible') sync(); else if (gdrive) renderSync(); }, 180000);
   $('exportBtn').onclick = exportBackup;
+  $('newShelfBtn').onclick = newShelf;
   $('importBtn').onclick = () => $('backupIn').click();
   $('backupIn').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) importBackup(f); };
 
@@ -1575,6 +1926,7 @@
     $('voiceSel').disabled = true;
     note('This browser has no built-in reading voice, so the highlight paces silently at the chosen speed.');
   }
+  const lastId = ls.get('lectern.last', ''); // read before the sample opens, or the sample would always win
   openBook(SAMPLE.id);
   $('gKey').value = settings.gkey;
   initGoogle();
@@ -1587,8 +1939,7 @@
     if (saved && saved.length) {
       saved.sort((a, b) => (a.added || 0) - (b.added || 0));
       books = [SAMPLE, ...saved];
-      const last = ls.get('lectern.last', '');
-      if (last && last !== SAMPLE.id && books.some(b => b.id === last)) openBook(last); else renderBooks();
+      if (lastId && lastId !== SAMPLE.id && books.some(b => b.id === lastId)) openBook(lastId); else { header(); renderBooks(); }
     }
   });
   renderSync();
